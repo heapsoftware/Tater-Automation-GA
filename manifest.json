@@ -4,10 +4,10 @@
     {
       "id": "automation_ga",
       "name": "Generative Agent",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "description": "Generative-Agent automation runner: LLM-authored smart-home automation rules executed by a deterministic runner, with a WebUI form editor and kernel tools.",
       "entry": "cores/automation_ga_core.py",
-      "sha256": "4f69bac7801c16ae2835ed4e77d62232c709551f5256641975128dfa45d129e5"
+      "sha256": "d5ab58e9f2ca1d41add76754f9cda7b202f72a56ad46534922dae847b6e801a9"
     }
   ]
 }

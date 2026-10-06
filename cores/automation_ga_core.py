@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -450,6 +450,16 @@ def _seconds_to_milliseconds(value: Any, default_ms: int = 0) -> int:
 def _redis():
     from helpers import redis_client as _rc
 
+    # Real Tater exposes ``redis_client`` as a lazy RedisClientProxy that is
+    # used directly (``redis_client.get(...)``); factory-style helpers instead
+    # return the client when called. Support both shapes.
+    client_like = False
+    try:
+        client_like = hasattr(_rc, "get") and hasattr(_rc, "hgetall")
+    except Exception:
+        client_like = False
+    if client_like or not callable(_rc):
+        return _rc
     return _rc()
 
 

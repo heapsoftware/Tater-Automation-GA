@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.1 — 2026-10-06 (revision)
+
+- **Fixes** — runner crash on install in the Tater runtime: `_redis()`
+  treated `helpers.redis_client` as a callable factory, but Tater exposes it
+  as a lazy `RedisClientProxy` used directly (`TypeError: 'RedisClientProxy'
+  object is not callable` on the first line of `run()`). Both shapes are now
+  handled: client-like objects are used as-is, callables are invoked.
+- **Changes** — uninstall data cleanup verified: all core-owned data
+  (`automation_ga_core:automations|meta|activity|pending`,
+  `automation_ga_core_settings`) is wiped by the Core Manager "delete all core
+  Redis data" cleanup, which runs the real host cleanup code in the offline
+  checklist (new section B10). No data-layout changes.
+
 ## 1.0.0 — 2026-10-06 (initial release)
 
 Initial release of the Generative Agent automation core.
