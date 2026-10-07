@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.2 — 2026-10-07 (revision)
+
+- **Fix** — WebUI automations list: `Announce ''` shown for announcements that
+  use the random-list or "LLM writes fresh text" modes. The list card's Action
+  row only read the fixed `message` field; it now shows a snippet of the first
+  random-list line (`Announce random of N: '…'`) or of the reference text
+  (`Announce fresh (LLM): '…'`), and `Announce (no text set)` when none is set.
+- **Changes** — "LLM writes fresh text" (`message_style`) now behaves the way
+  the form implies: the text you enter in the fresh-text box is sent to the
+  base LLM as a *reference announcement*, and each run the LLM writes a fresh
+  variation of it — same meaning, facts and tone, different words — instead of
+  treating the box as a bare style description. A per-run variation seed and a
+  higher sampling temperature are added to the prompt so consecutive runs of
+  the same reference produce different wording rather than near-identical text.
+  The form field is relabeled "Reference for fresh text" and the schema docs,
+  validation messages and error text now describe the reference behavior. No
+  definition-schema change: existing `message_style` automations keep working,
+  and their box content now reads as the reference it was intended to be.
+- Tests: 4 new checks (list-page snippets for random-list and fresh-text
+  announces, reference prompt with per-run seed + temperature sent to the base
+  LLM) — 116-check smoke + 51-check live-checklist mirror, both passing
+  offline.
+
 ## 1.1.1 — 2026-10-07 (revision)
 
 - **Fix** — WebUI form editor: creating an automation now returns the panel to the
