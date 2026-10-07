@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.1 — 2026-10-07 (revision)
+
+- **Fix** — WebUI form editor: creating an automation now returns the panel to the
+  Automations list along with the success popup. The Create tab previously stayed
+  active, leaving the new automation out of sight until the tab was clicked. A
+  successful `ga_create_automation` sets a one-shot marker (`automation_ga_core:ui_state`);
+  the tab-data fetch that follows — the renderer's post-action refresh — omits the
+  Create tab and sets `default_tab` to `automations`, which is the only case the
+  renderer re-anchors the active manager tab. The Create tab is offered again from
+  the next load, so further automations can still be created from the form.
+  Rejected creates set no marker.
+- Tests: 6 new checks (post-create refresh lands on the automations list, repeats
+  for the next create, Create tab reappears on the next fetch, rejected create sets
+  no marker) — 114-check smoke + 51-check live-checklist mirror, both passing
+  offline.
+
 ## 1.1.0 — 2026-10-06 (minor)
 
 - **Features** — device + state pickers in the WebUI form editor:

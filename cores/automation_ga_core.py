@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -155,6 +155,7 @@ PENDING_KEY = f"{MODULE_KEY}:pending"
 INTEGRATION_STATES_KEY = "tater:integration_runtime:states"
 INTEGRATION_EVENTS_KEY = "tater:integration_runtime:events"
 ENTITY_STATES_KEY = f"{MODULE_KEY}:entity_states"
+UI_STATE_KEY = f"{MODULE_KEY}:ui_state"
 
 LEAF_ACTION_TYPES = ("call_service", "announce", "notify", "wait")
 ALL_ACTION_TYPES = ("ask_yes_no", "camera_ai", "device", *LEAF_ACTION_TYPES)
@@ -5792,10 +5793,28 @@ def _saved_destination_catalogs(automations: Dict[str, Dict[str, Any]]) -> Tuple
     return announcement_targets, notification_targets
 
 
+def _take_post_create_tab_return(client: Any) -> bool:
+    """Consume the one-shot marker set by ``ga_create_automation``.
+
+    The WebUI renderer only re-picks the active manager tab when the current
+    tab disappears from ``manager_tabs`` (falling back to ``default_tab``), so
+    the refresh that follows a successful create omits the Create tab for
+    exactly one fetch: the panel lands back on the Automations list while the
+    success popup shows, and the Create tab is offered again from the next
+    load.
+    """
+    raw = client.get(UI_STATE_KEY)
+    if not raw:
+        return False
+    client.set(UI_STATE_KEY, "")
+    return True
+
+
 def get_htmlui_tab_data(redis_client: Any = None, core_key: str = "", core_tab: Any = None) -> Dict[str, Any]:
     rc = redis_client if redis_client is not None else _redis()
     registry = _registry(rc)
     automations = _load_automations(rc)
+    return_to_automations = _take_post_create_tab_return(rc)
     metas = _load_meta(rc)
     enabled_count = sum(1 for definition in automations.values() if _automation_enabled(definition))
     pending = _pending_summaries(rc)
@@ -5832,6 +5851,27 @@ def get_htmlui_tab_data(redis_client: Any = None, core_key: str = "", core_tab: 
                 "detail": _text(row.get("detail")),
             }
         )
+    manager_tabs = [
+        {
+            "key": "automations",
+            "label": "Automations",
+            "source": "items",
+            "item_group": "automations",
+            "selector": False,
+            "empty_message": "No automations configured.",
+        },
+        {"key": "create", "label": "Create Automation", "source": "add_form"},
+        {
+            "key": "activity",
+            "label": "Activity",
+            "source": "items",
+            "item_group": "activity",
+            "selector": False,
+            "empty_message": "No activity yet.",
+        },
+    ]
+    if return_to_automations:
+        manager_tabs = [tab for tab in manager_tabs if tab["key"] != "create"]
     return {
         "summary": "Generative Agent automations — build them by chatting with Tater or using the form editor.",
         "stats": [
@@ -5850,26 +5890,8 @@ def get_htmlui_tab_data(redis_client: Any = None, core_key: str = "", core_tab: 
             "stats_refresh_action": "ga_refresh_devices",
             "item_fields_popup": True,
             "item_fields_popup_label": "Edit Automation",
-            "default_tab": "create" if not automations else "automations",
-            "manager_tabs": [
-                {
-                    "key": "automations",
-                    "label": "Automations",
-                    "source": "items",
-                    "item_group": "automations",
-                    "selector": False,
-                    "empty_message": "No automations configured.",
-                },
-                {"key": "create", "label": "Create Automation", "source": "add_form"},
-                {
-                    "key": "activity",
-                    "label": "Activity",
-                    "source": "items",
-                    "item_group": "activity",
-                    "selector": False,
-                    "empty_message": "No activity yet.",
-                },
-            ],
+            "default_tab": "automations" if (return_to_automations or automations) else "create",
+            "manager_tabs": manager_tabs,
             "add_form": {
                 "action": "ga_create_automation",
                 "submit_label": "Create Automation",
@@ -5921,6 +5943,7 @@ def handle_htmlui_tab_action(
         definition["id"] = auto_id
         rc.hset(AUTOMATIONS_KEY, auto_id, json.dumps(definition, separators=(",", ":"), default=str))
         _log_activity(rc, auto_id, _text(definition.get("name")), "created", "form editor")
+        rc.set(UI_STATE_KEY, "return_to_automations")
         return {"ok": True, "id": auto_id, "message": f"Automation '{_text(definition.get('name'))}' created."}
     if action == "ga_save_automation":
         existing = automations.get(auto_id)
