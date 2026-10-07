@@ -5,7 +5,7 @@ built on the HGA "Sentinel" principle: **the LLM authors the automation
 rules, a deterministic runner executes them**. The runner never
 improvises — it only performs what a validated definition says.
 
-Version **1.0.1** · Runs on every Tater platform (webui, discord,
+Version **1.1.0** · Runs on every Tater platform (webui, discord,
 voice_core, portals, Little Spud)
 
 ## What it does
@@ -15,7 +15,9 @@ platform) or with the WebUI form editor, then executed by a polling
 runner:
 
 - **Triggers** — entity state (with an arming/hold: it only fires once
-  the state has held for N seconds), interval, time-of-day, and
+  the state has held for N seconds) and edge transitions (`from_state`
+  / `to_state`: fire once when the state changes from X to Y, with an
+  optional hold on the new state), plus interval, time-of-day, and
   protect events (camera detections).
 - **Conditions (all must pass)** — HA attribute matching
   (above / below / equals / contains), camera-vision YES/NO verdict on
@@ -35,13 +37,19 @@ runner:
     "yes" (spoken or via the answer webhook,
     `/webhook/answer?p=<pending_id>&response=yes|no`); "no" or timeout
     skips it, and the verdict is logged.
-- **Kernel tools** — ten `automation_*` tools (capabilities, validate,
-  create, list, get, update, delete, toggle, run, activity) available on
+- **Kernel tools** — eleven `automation_*` tools (capabilities, validate,
+  create, list, get, update, delete, toggle, run, activity,
+  entity_states) available on
   every platform, so the assistant can author and manage automations
-  directly in chat.
+  directly in chat. `automation_entity_states` looks up an entity's
+  current state, the possible states learned from Home Assistant
+  history, and recent transitions — real state names instead of
+  guessed ones.
 - **WebUI** — a **Generative Agent** tab: automation manager, item
   cards with a Test-now run button, an Add-Automation form, and an
-  Edit-Automation popup for form-supported rules.
+  Edit-Automation popup for form-supported rules. Devices and their
+  states are dropdowns fed by Home Assistant (entity history + live
+  state), so picking "Washer → finished" needs no entity-ID typing.
 - **Activity log** — a recent-events feed (triggered, runs, answers,
   timeouts, created/updated/deleted).
 

@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -154,6 +154,7 @@ PENDING_KEY = f"{MODULE_KEY}:pending"
 
 INTEGRATION_STATES_KEY = "tater:integration_runtime:states"
 INTEGRATION_EVENTS_KEY = "tater:integration_runtime:events"
+ENTITY_STATES_KEY = f"{MODULE_KEY}:entity_states"
 
 LEAF_ACTION_TYPES = ("call_service", "announce", "notify", "wait")
 ALL_ACTION_TYPES = ("ask_yes_no", "camera_ai", "device", *LEAF_ACTION_TYPES)
@@ -177,6 +178,70 @@ _CAMERA_MEDIA_MODE_OPTIONS = [
         "icon": "▶",
     },
 ]
+
+# entity state catalog: possible states per HA entity, sourced from the HA
+# recorder history API and cached in Redis (see _refresh_state_catalog).
+_HA_HISTORY_WINDOW_HOURS = 72
+_HA_HISTORY_TIMEOUT_SECONDS = 20.0
+_HA_HISTORY_MAX_ENTITIES_PER_CALL = 50
+_HA_HISTORY_MAX_ROWS = 20_000
+_STATE_CATALOG_TTL_SECONDS = 60.0
+_STATE_CATALOG_MAX_STATES = 25
+_STATE_CATALOG_MAX_TRANSITIONS = 12
+_STATE_FORM_MAX_OPTIONS = 8
+_ENTITY_STATE_SKIP_DOMAINS = frozenset(
+    {
+        "update",
+        "button",
+        "event",
+        "conversation",
+        "assist_satellite",
+        "stt",
+        "tts",
+        "wake_word",
+        "image",
+        "video",
+        "camera",
+        "number",
+        "select",
+        "text",
+        "scene",
+        "script",
+        "button_group",
+    }
+)
+_DOMAIN_STATE_VOCAB: Dict[str, Tuple[str, ...]] = {
+    "switch": ("on", "off"),
+    "light": ("on", "off"),
+    "fan": ("on", "off"),
+    "input_boolean": ("on", "off"),
+    "binary_sensor": ("on", "off"),
+    "person": ("home", "not_home"),
+    "device_tracker": ("home", "not_home"),
+    "lock": ("locked", "unlocked"),
+    "cover": ("open", "closed", "opening", "closing", "stopped"),
+    "climate": ("off", "heat", "cool", "heat_cool", "auto"),
+    "media_player": ("playing", "paused", "idle", "standby", "off", "on"),
+    "sun": ("above_horizon", "below_horizon"),
+    "vacuum": ("cleaning", "paused", "docked", "returning", "error"),
+    "humidifier": ("on", "off"),
+    "water_heater": ("off", "eco", "heat_pump", "gas", "electric"),
+    "alarm_control_panel": ("disarmed", "armed_home", "armed_away", "armed_night"),
+}
+# attributes that enumerate the values an entity can take
+_ENTITY_OPTION_ATTRS = (
+    "options",
+    "hvac_modes",
+    "fan_modes",
+    "swing_modes",
+    "preset_modes",
+    "source_list",
+    "effect_list",
+    "sound_mode_list",
+    "available_presets",
+    "preset_list",
+)
+_FORM_CUSTOM_SENTINEL = "__custom__"
 
 _CATEGORY_ICONS = {
     "light": "☀",
@@ -1312,6 +1377,390 @@ def _ha_call_service(client: Any, domain: str, service: str, data: Dict[str, Any
 
 
 # ---------------------------------------------------------------------------
+# entity state catalog: possible states per entity from HA recorder history
+# ---------------------------------------------------------------------------
+
+def _ha_rest_config(rc: Any) -> Tuple[str, str]:
+    """base URL + bearer token for direct HA REST calls, reusing the integration's own credentials."""
+    try:
+        from integration_runtime import load_homeassistant_config
+
+        conf = load_homeassistant_config(required=False, client=rc)
+        if isinstance(conf, dict):
+            base = _text(conf.get("base"))
+            token = _text(conf.get("token"))
+            if base and token:
+                return base, token
+    except Exception:
+        pass
+    conf = _homeassistant_config()
+    return conf.get("base", ""), conf.get("token", "")
+
+
+def _ha_history_timestamp(value: Any) -> float:
+    raw = _text(value)
+    if not raw:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _ha_entity_history(
+    client: Any,
+    entity_ids: Sequence[Any],
+    window_hours: float = _HA_HISTORY_WINDOW_HOURS,
+) -> Dict[str, List[Tuple[str, float]]]:
+    """entity_id -> chronological [(state, last_changed)] from the HA recorder history API.
+
+    Returns {} when HA is unreachable, unconfigured, or the recorder has no data —
+    callers must degrade to fallback state sources.
+    """
+    rc = client if client is not None else _redis()
+    wanted: List[str] = []
+    for entity_id in entity_ids:
+        token = _text(entity_id)
+        if token and token not in wanted:
+            wanted.append(token)
+    if not wanted or requests is None:
+        return {}
+    base, token = _ha_rest_config(rc)
+    if not base or not token:
+        return {}
+    start = datetime.fromtimestamp(time.time() - max(1.0, window_hours) * 3600.0).astimezone().isoformat()
+    url = f"{base.rstrip('/')}/api/history/period/{quote(start)}"
+    params: List[Tuple[str, str]] = [
+        ("filter_entity_id", ",".join(wanted[:_HA_HISTORY_MAX_ENTITIES_PER_CALL])),
+        ("minimal_response", "true"),
+        ("no_attributes", "true"),
+    ]
+    try:
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=_HA_HISTORY_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            logger.warning("HA history request failed with HTTP %s", response.status_code)
+            return {}
+        payload = response.json()
+    except Exception as exc:
+        logger.warning("HA history request failed: %s", exc)
+        return {}
+    if not isinstance(payload, list):
+        return {}
+    rows = 0
+    out: Dict[str, List[Tuple[str, float]]] = {}
+    for index, block in enumerate(payload):
+        entity_id = wanted[index] if index < len(wanted) else ""
+        if not isinstance(block, list):
+            continue
+        timeline: List[Tuple[str, float]] = []
+        for entry in block:
+            if rows >= _HA_HISTORY_MAX_ROWS:
+                break
+            state = ""
+            ts = 0.0
+            if isinstance(entry, dict):
+                state = _text(entry.get("state"))
+                ts = _ha_history_timestamp(entry.get("last_changed") or entry.get("last_updated"))
+                entity_id = _text(entry.get("entity_id")) or entity_id
+            elif isinstance(entry, list) and entry:
+                # compact minimal_response rows: [state, last_changed, ...]
+                state = _text(entry[0] if not isinstance(entry[0], list) else "")
+                ts = _ha_history_timestamp(entry[1]) if len(entry) > 1 else 0.0
+            if state:
+                timeline.append((state, ts))
+                rows += 1
+        if entity_id and timeline:
+            existing = out.setdefault(entity_id, [])
+            existing.extend(timeline)
+    return out
+
+
+def _entity_state_fallback(row: Optional[Dict[str, Any]], entity_id: str) -> List[str]:
+    """Candidate states for an entity without history: enumerating attributes, domain vocabulary, live state."""
+    domain = entity_id.split(".", 1)[0]
+    out: List[str] = []
+    if row is not None:
+        for attr in _ENTITY_OPTION_ATTRS:
+            raw = _entity_attribute_value(row, attr)
+            if isinstance(raw, list):
+                for item in raw:
+                    token = _text(item)
+                    if token and token not in out:
+                        out.append(token)
+            elif _text(raw) and _text(raw) not in out:
+                out.append(_text(raw))
+    for state in _DOMAIN_STATE_VOCAB.get(domain, ()):
+        if state not in out:
+            out.append(state)
+    if row is not None:
+        live = _text(row.get("state"))
+        if live and live not in out:
+            out.append(live)
+    return out
+
+
+def _state_catalog_read(rc: Any, entity_id: str, *, max_age: float = _STATE_CATALOG_TTL_SECONDS) -> Optional[Dict[str, Any]]:
+    try:
+        raw = rc.hget(ENTITY_STATES_KEY, _text(entity_id))
+    except Exception:
+        return None
+    record = _json_loads(raw, None)
+    if not isinstance(record, dict):
+        return None
+    if max_age > 0 and _as_float(record.get("fetched_at"), 0.0) < time.time() - max_age:
+        return None
+    return record
+
+
+def _state_catalog_write(rc: Any, entity_id: str, record: Dict[str, Any]) -> None:
+    try:
+        rc.hset(ENTITY_STATES_KEY, _text(entity_id), json.dumps(record, separators=(",", ":"), default=str))
+    except Exception as exc:
+        logger.warning("could not persist entity state catalog for %s: %s", entity_id, exc)
+
+
+def _refresh_state_catalog(client: Any, entity_ids: Sequence[Any], *, force: bool = False) -> int:
+    """Refresh the cached possible-states catalog for the given entities. Returns entities refreshed."""
+    rc = client if client is not None else _redis()
+    wanted: List[str] = []
+    for entity_id in entity_ids:
+        token = _text(entity_id)
+        if token and token not in wanted:
+            wanted.append(token)
+    if not wanted:
+        return 0
+    stale = [] if force else [e for e in wanted if _state_catalog_read(rc, e) is None]
+    if not stale:
+        stale = wanted
+    history: Dict[str, List[Tuple[str, float]]] = {}
+    for offset in range(0, len(stale), _HA_HISTORY_MAX_ENTITIES_PER_CALL):
+        chunk = stale[offset:offset + _HA_HISTORY_MAX_ENTITIES_PER_CALL]
+        history.update(_ha_entity_history(rc, chunk))
+    rows = _ha_entities(rc)
+    now = time.time()
+    refreshed = 0
+    for entity_id in stale:
+        timeline = history.get(entity_id, [])
+        catalog_states: Dict[str, float] = {}
+        transitions: List[List[Any]] = []
+        previous = ""
+        for state, ts in timeline:
+            if state:
+                catalog_states[state] = max(catalog_states.get(state, 0.0), ts or now)
+            if state and previous and state != previous:
+                transitions.append([previous, state, ts or now])
+            previous = state
+        row = rows.get(entity_id)
+        live = _text(row.get("state")) if row else ""
+        if live:
+            catalog_states[live] = max(catalog_states.get(live, 0.0), now)
+        ordered = sorted(catalog_states.items(), key=lambda pair: pair[1], reverse=True)
+        if len(ordered) > _STATE_CATALOG_MAX_STATES:
+            keep = {state for state, _ts in ordered[:_STATE_CATALOG_MAX_STATES]}
+            if live:
+                keep.add(live)
+            ordered = [(state, ts) for state, ts in ordered if state in keep]
+        source = "history" if timeline else ("live" if live else "none")
+        record = {
+            "fetched_at": now,
+            "source": source,
+            "states": [[state, ts] for state, ts in ordered[:_STATE_CATALOG_MAX_STATES]],
+            "transitions": transitions[-_STATE_CATALOG_MAX_TRANSITIONS:],
+        }
+        _state_catalog_write(rc, entity_id, record)
+        refreshed += 1
+    return refreshed
+
+
+_STATE_CATALOG_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="automation-ga-states")
+_STATE_CATALOG_REFRESH_LOCK = threading.Lock()
+_STATE_CATALOG_PENDING: set[str] = set()
+
+
+def _refresh_state_catalog_async(client: Any, entity_ids: Iterable[Any]) -> None:
+    """Queue a background catalog refresh; never blocks the caller (runner tick / tab render)."""
+    todo = [e for e in entity_ids if _text(e)]
+    if not todo:
+        return
+    with _STATE_CATALOG_REFRESH_LOCK:
+        fresh = [e for e in todo if e not in _STATE_CATALOG_PENDING]
+        _STATE_CATALOG_PENDING.update(fresh)
+    if not fresh:
+        return
+
+    def _run() -> None:
+        try:
+            _refresh_state_catalog(client, list(fresh))
+        except Exception as exc:
+            logger.warning("entity state catalog refresh failed: %s", exc)
+        finally:
+            with _STATE_CATALOG_REFRESH_LOCK:
+                for entity_id in fresh:
+                    _STATE_CATALOG_PENDING.discard(entity_id)
+
+    try:
+        _STATE_CATALOG_EXECUTOR.submit(_run)
+    except Exception:
+        with _STATE_CATALOG_REFRESH_LOCK:
+            for entity_id in fresh:
+                _STATE_CATALOG_PENDING.discard(entity_id)
+
+
+def _state_catalog_states(rc: Any, entity_id: str, rows: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[List[str], str]:
+    """Merged candidate states for the UI: catalog (history) first, then fallbacks. (states, source)"""
+    record = _state_catalog_read(rc, entity_id, max_age=max(_STATE_CATALOG_TTL_SECONDS, 86400.0))
+    out: List[str] = []
+    source = "none"
+    if record is not None:
+        source = _text(record.get("source")) or "none"
+        for entry in record.get("states") if isinstance(record.get("states"), list) else []:
+            if isinstance(entry, (list, tuple)) and entry:
+                token = _text(entry[0])
+            else:
+                token = _text(entry)
+            if token and token not in out:
+                out.append(token)
+    if rows is None:
+        rows = _ha_entities(rc)
+    row = rows.get(entity_id)
+    for state in _entity_state_fallback(row, entity_id):
+        if state not in out:
+            out.append(state)
+    return out[:_STATE_CATALOG_MAX_STATES * 2], source
+
+
+def _state_catalog_transitions(rc: Any, entity_id: str, limit: int = 6) -> List[Tuple[str, str, float]]:
+    record = _state_catalog_read(rc, entity_id, max_age=max(_STATE_CATALOG_TTL_SECONDS, 86400.0))
+    out: List[Tuple[str, str, float]] = []
+    for entry in record.get("transitions") if isinstance(record, dict) and isinstance(record.get("transitions"), list) else []:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            out.append((_text(entry[0]), _text(entry[1]), _as_float(entry[2] if len(entry) > 2 else 0, 0.0)))
+    return out[-limit:]
+
+
+def _automation_entities(automations: Dict[str, Dict[str, Any]]) -> List[str]:
+    """HA entity ids referenced by automation triggers/conditions."""
+    out: List[str] = []
+    for definition in automations.values():
+        if not isinstance(definition, dict) or not _automation_enabled(definition):
+            continue
+        for section in ("trigger", "conditions"):
+            block = definition.get(section)
+            items = [block] if section == "trigger" else (block if isinstance(block, list) else [])
+            for spec in items:
+                if isinstance(spec, dict) and _text(spec.get("type")) == "entity_state":
+                    entity_id = _text(spec.get("entity"))
+                    if entity_id and entity_id not in out:
+                        out.append(entity_id)
+    return out
+
+
+def _ha_entity_options(
+    rc: Any,
+    *,
+    rows: Optional[Dict[str, Dict[str, Any]]] = None,
+    current_values: Sequence[Any] = (),
+) -> List[Dict[str, str]]:
+    """Dropdown options for HA entities: friendly names, noise domains filtered out."""
+    entities = rows if rows is not None else _ha_entities(rc)
+    out: List[Dict[str, str]] = []
+    for entity_id in sorted(entities, key=lambda e: (e.casefold())):
+        row = entities[entity_id]
+        domain = entity_id.split(".", 1)[0]
+        if domain in _ENTITY_STATE_SKIP_DOMAINS:
+            continue
+        friendly = _text(row.get("friendly_name"))
+        label = f"{friendly} ({entity_id})" if friendly and friendly != entity_id else entity_id
+        out.append({"value": entity_id, "label": label})
+    for value in current_values:
+        token = _text(value)
+        if token and not any(row.get("value") == token for row in out):
+            out.append({"value": token, "label": f"{token} (saved)"})
+    out.sort(key=lambda row: (_text(row.get("label")).casefold(), _text(row.get("value"))))
+    return out
+
+
+def _entity_state_dependency(
+    rc: Any,
+    entity_ids: Iterable[Any],
+    *,
+    source_key: str,
+    empty_label: str = "",
+    fallback_default: Optional[List[Dict[str, str]]] = None,
+    ensure: Optional[Dict[str, Sequence[Any]]] = None,
+    rows: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """dependent_options map: entity_id -> candidate states (plain strings) for the WebUI renderer.
+
+    empty_label prepends a "no value" option to every entity's list (e.g. "Any state");
+    ensure pins values (e.g. a saved state history has pruned) into their entity's list.
+    """
+    ensure_map = {
+        _text(entity_id): [_text(value) for value in values if _text(value)]
+        for entity_id, values in (ensure or {}).items()
+    }
+    options_by_source: Dict[str, List[Any]] = {}
+    for entity_id in entity_ids:
+        token = _text(entity_id)
+        if not token:
+            continue
+        states, _source = _state_catalog_states(rc, token, rows=rows)
+        if not states:
+            continue
+        option_rows: List[Any] = [{"value": "", "label": empty_label}] if empty_label else []
+        option_rows.extend(states[:_STATE_FORM_MAX_OPTIONS])
+        for extra in ensure_map.get(token, ()):
+            if all(_text(row.get("value") if isinstance(row, dict) else row) != extra for row in option_rows):
+                option_rows.append(extra)
+        options_by_source[token] = option_rows
+    return {
+        "source_key": source_key,
+        "options_by_source": options_by_source,
+        "default_options": list(fallback_default or []),
+    }
+
+
+def _definition_watch_entities(definition: Dict[str, Any]) -> List[str]:
+    """Entity ids referenced by one definition's trigger + entity_state conditions."""
+    out: List[str] = []
+    sections: List[Any] = [definition.get("trigger")]
+    conditions = definition.get("conditions")
+    if isinstance(conditions, list):
+        sections.extend(conditions)
+    for spec in sections:
+        if isinstance(spec, dict) and _text(spec.get("type")) == "entity_state":
+            entity_id = _text(spec.get("entity"))
+            if entity_id and entity_id not in out:
+                out.append(entity_id)
+    return out
+
+
+def _entity_activity_hint(rc: Any, entity_id: str, rows: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+    """One-line 'currently X, recent transitions' hint for the form, empty when nothing is known."""
+    entity_id = _text(entity_id)
+    if not entity_id:
+        return ""
+    if rows is None:
+        rows = _ha_entities(rc)
+    row = rows.get(entity_id)
+    live = _text(row.get("state")) if row else ""
+    parts: List[str] = []
+    if live:
+        parts.append(f"currently '{live}'")
+    transitions = _state_catalog_transitions(rc, entity_id)
+    if transitions:
+        chain = " → ".join(f"{frm}→{to}" for frm, to, _ts in transitions[-4:])
+        parts.append(f"recent: {chain}")
+    return "; ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # integration events (UniFi Protect person detection etc.)
 # ---------------------------------------------------------------------------
 
@@ -2021,6 +2470,14 @@ def _validate_entity_spec(
         errors.append(f"{label}: entity_state requires 'entity'")
         return
     _check_entity_known(client, spec.get("entity"), warnings)
+    from_state = _text(spec.get("from_state"))
+    to_state = _text(spec.get("to_state"))
+    if from_state or to_state:
+        if _text(spec.get("state")):
+            warnings.append(f"{label}: 'state' is ignored when from_state/to_state are set — the trigger fires on transitions")
+        if _text(spec.get("attribute")):
+            errors.append(f"{label}: from_state/to_state cannot be combined with attribute matching")
+        return
     if _text(spec.get("attribute")):
         match_op = _text(spec.get("match") or "equals").lower()
         if match_op not in ENTITY_MATCH_OPS:
@@ -2863,12 +3320,61 @@ def _evaluate_conditions(
     return True, "all conditions passed"
 
 
+def _edge_trigger_due(
+    client: Any,
+    auto_id: str,
+    trigger: Dict[str, Any],
+    state_seen: Dict[str, str],
+    edge_since: Dict[str, float],
+) -> Tuple[bool, str]:
+    """Edge-triggered entity_state: fire on a state transition (from_state -> to_state), not while a state holds.
+
+    state_seen tracks the last observed state per (auto_id, entity) — the baseline is recorded
+    silently on the first tick so a runner restart never causes a spurious fire.
+    """
+    rc = client if client is not None else _redis()
+    entity_id = _text(trigger.get("entity"))
+    from_state = _text(trigger.get("from_state"))
+    to_state = _text(trigger.get("to_state"))
+    key = f"{auto_id}:{entity_id}"
+    if not entity_id:
+        return False, ""
+    row = _ha_entities(rc).get(entity_id)
+    current = _text(row.get("state")) if row else ""
+    if not current:
+        return False, ""
+    previous = _text(state_seen.get(key))
+    if not previous:
+        state_seen[key] = current
+        return False, ""
+    for_seconds = max(0.0, _as_float(trigger.get("for_seconds"), 0.0))
+    if current == previous:
+        since = _as_float(edge_since.get(key, 0.0), 0.0)
+        if since > 0 and time.time() - since >= for_seconds:
+            edge_since.pop(key, None)
+            return True, f"{entity_id} held '{current}' for {for_seconds:.0f}s"
+        return False, ""
+    # an actual transition previous -> current happened
+    state_seen[key] = current
+    from_ok = not from_state or previous == from_state
+    to_ok = not to_state or current == to_state
+    if not (from_ok and to_ok):
+        edge_since.pop(key, None)
+        return False, ""
+    if for_seconds <= 0:
+        return True, f"{entity_id} changed '{previous}' → '{current}'"
+    edge_since[key] = time.time()
+    return False, ""
+
+
 def _trigger_due(
     client: Any,
     auto_id: str,
     definition: Dict[str, Any],
     meta: Dict[str, Any],
     state_since: Dict[str, float],
+    state_seen: Optional[Dict[str, str]] = None,
+    edge_since: Optional[Dict[str, float]] = None,
 ) -> Tuple[bool, str]:
     rc = client if client is not None else _redis()
     trigger = definition.get("trigger") if isinstance(definition.get("trigger"), dict) else {}
@@ -2882,6 +3388,16 @@ def _trigger_due(
             return True, f"interval {interval:.0f}s elapsed"
         return False, ""
     if trigger_type == "entity_state":
+        from_state = _text(trigger.get("from_state"))
+        to_state = _text(trigger.get("to_state"))
+        if from_state or to_state:
+            return _edge_trigger_due(
+                rc,
+                auto_id,
+                trigger,
+                state_seen if state_seen is not None else {},
+                edge_since if edge_since is not None else {},
+            )
         entity_id = _text(trigger.get("entity"))
         satisfied, detail = _entity_state_match(rc, trigger)
         key = f"{auto_id}:{entity_id}"
@@ -2933,10 +3449,20 @@ def _tick(client: Any) -> None:
     metas = _load_meta(rc)
     # restore arming trackers persisted by previous ticks
     state_since: Dict[str, float] = {}
+    state_seen: Dict[str, str] = {}
+    edge_since: Dict[str, float] = {}
     for meta in metas.values():
         saved = meta.get("state_since") if isinstance(meta.get("state_since"), dict) else {}
         for key, ts in saved.items():
             state_since[str(key)] = _as_float(ts, 0.0)
+        seen = meta.get("state_seen") if isinstance(meta.get("state_seen"), dict) else {}
+        for key, value in seen.items():
+            state_seen[str(key)] = _text(value)
+        edge = meta.get("edge_since") if isinstance(meta.get("edge_since"), dict) else {}
+        for key, ts in edge.items():
+            edge_since[str(key)] = _as_float(ts, 0.0)
+    # background-refresh the possible-states catalog for entities automations watch
+    _refresh_state_catalog_async(rc, _automation_entities(automations))
     for auto_id, definition in automations.items():
         meta = _meta_for(metas, auto_id)
         if not _automation_enabled(definition):
@@ -2946,7 +3472,7 @@ def _tick(client: Any) -> None:
             continue
         if meta.get("busy"):
             continue
-        due, trigger_detail = _trigger_due(rc, auto_id, definition, meta, state_since)
+        due, trigger_detail = _trigger_due(rc, auto_id, definition, meta, state_since, state_seen, edge_since)
         if not due:
             continue
         passed, condition_detail = _evaluate_conditions(rc, auto_id, definition, meta, state_since)
@@ -2956,12 +3482,21 @@ def _tick(client: Any) -> None:
         _execute_automation(rc, auto_id, definition, meta, trigger_detail)
     # persist arming trackers without clobbering metas freshly saved by runs this tick
     for auto_id in automations:
-        own = {k: v for k, v in state_since.items() if k.startswith(f"{auto_id}:")}
-        if not own:
+        own_since = {k: v for k, v in state_since.items() if k.startswith(f"{auto_id}:")}
+        own_seen = {k: v for k, v in state_seen.items() if k.startswith(f"{auto_id}:")}
+        own_edge = {k: v for k, v in edge_since.items() if k.startswith(f"{auto_id}:")}
+        if not own_since and not own_seen and not own_edge:
             continue
         fresh = _load_meta(rc).get(auto_id) or {}
-        fresh.setdefault("state_since", {})
-        fresh["state_since"].update(own)
+        if own_since:
+            fresh.setdefault("state_since", {})
+            fresh["state_since"].update(own_since)
+        if own_seen:
+            fresh.setdefault("state_seen", {})
+            fresh["state_seen"].update(own_seen)
+        if own_edge:
+            fresh.setdefault("edge_since", {})
+            fresh["edge_since"].update(own_edge)
         _save_meta(rc, str(auto_id), fresh)
 
 
@@ -3015,8 +3550,12 @@ REQUIRED:
   "trigger": object — one of:
     {{"type": "interval", "seconds": 60}}
     {{"type": "entity_state", "entity": "switch.stove", "state": "on", "for_seconds": 900}}   (for_seconds: must stay true this long)
+    {{"type": "entity_state", "entity": "sensor.washer", "from_state": "spinning", "to_state": "finished", "for_seconds": 0}}
+        (edge trigger: fires once per state TRANSITION, not while the state holds; omit from_state = from any state;
+         omit to_state = any change out of from_state; both omitted = any change. Use for 'when the washer finishes'.)
     {{"type": "entity_state", "entity": "sensor.living_temp", "attribute": "current_temperature", "match": "above", "value": 27}}
-        (attribute: dotted path into HA attributes, e.g. current_temperature; match: equals | not_equals | contains | above | below)
+        (attribute: dotted path into HA attributes, e.g. current_temperature; match: equals | not_equals | contains | above | below;
+         cannot be combined with from_state/to_state)
     {{"type": "time", "time": "07:30"}}                                                 (daily)
     {{"type": "protect_event", "camera": "great room", "event_type": "person"}}          (UniFi Protect event)
 OPTIONAL:
@@ -3051,6 +3590,9 @@ OPTIONAL:
   "enabled": true/false
 
 RULES:
+- Call automation_entity_states before writing entity_state specs: it returns the states an
+  entity has actually shown (HA history), recent transitions, and fallback options — never
+  invent state names for a sensor.
 - camera_ai and camera_vision run the vision model and may block the runner for up to ~90s.
 - camera devices are looked up in the integration registry: encoded "provider|device_id", or a name/room substring.
 - ask_yes_no branches may only contain call_service/announce/notify/wait.
@@ -3070,6 +3612,11 @@ def get_hydra_kernel_tools(platform: str = "", redis_client: Any = None, core_ke
             "id": "automation_capabilities",
             "description": "Returns the automation definition schema, rules, the current list of Home Assistant entity ids with states, and camera-capable devices. Call this before creating or editing automations.",
             "usage": '{"function":"automation_capabilities","arguments":{"include_entities":true}}',
+        },
+        {
+            "id": "automation_entity_states",
+            "description": "Returns the states a Home Assistant entity has actually shown (from HA history), its recent state transitions, and fallback options. Call it before writing an entity_state trigger or condition so the states you pick are real.",
+            "usage": '{"function":"automation_entity_states","arguments":{"entity":"sensor.washer"}}',
         },
         {
             "id": "automation_create",
@@ -3140,6 +3687,68 @@ def run_hydra_kernel_tool(
         if not include_entities:
             doc = doc.split("CURRENT HOME ASSISTANT ENTITIES")[0]
         return {"ok": True, "facts": ["Automation definition schema returned"], "data": {"schema": doc}, "say_hint": "Use the schema to build the automation definition."}
+
+    if tool == "automation_entity_states":
+        requested = [_text(args.get("entity"))] if _text(args.get("entity")) else []
+        raw_list = args.get("entities")
+        if isinstance(raw_list, list):
+            requested.extend(_text(item) for item in raw_list)
+        requested = [entity_id for entity_id in dict.fromkeys(requested) if entity_id]
+        if not requested:
+            return {
+                "ok": False,
+                "error": {"code": "missing_entity", "message": "Pass 'entity' (or 'entities') — the entity id to inspect."},
+                "say_hint": "Ask which device the user means, or list entity ids with automation_capabilities.",
+            }
+        rows = _ha_entities(rc)
+        resolved: List[str] = []
+        for entity_id in requested:
+            if entity_id in rows:
+                resolved.append(entity_id)
+                continue
+            lowered = entity_id.casefold()
+            matches = [
+                candidate
+                for candidate in rows
+                if lowered in candidate.casefold()
+                or _text(rows[candidate].get("friendly_name")).casefold() == lowered
+            ]
+            resolved.extend(matches[:3])
+        resolved = [entity_id for entity_id in dict.fromkeys(resolved) if entity_id][:10]
+        if not resolved:
+            return {
+                "ok": False,
+                "error": {"code": "not_found", "message": f"None of {requested} match a Home Assistant entity with a cached state."},
+                "say_hint": "List entities with automation_capabilities to find the right entity id.",
+            }
+        try:
+            _refresh_state_catalog(rc, resolved)
+        except Exception as exc:
+            logger.warning("state catalog refresh failed in automation_entity_states: %s", exc)
+        data: Dict[str, Dict[str, Any]] = {}
+        for entity_id in resolved:
+            states, source = _state_catalog_states(rc, entity_id, rows=rows)
+            row = rows.get(entity_id)
+            data[entity_id] = {
+                "friendly_name": _text(row.get("friendly_name")) if row else "",
+                "current_state": _text(row.get("state")) if row else "",
+                "possible_states": states,
+                "state_source": source,
+                "recent_transitions": [
+                    {"from": frm, "to": to, "at": _now_label(ts) if ts else ""}
+                    for frm, to, ts in _state_catalog_transitions(rc, entity_id)
+                ],
+            }
+        facts = [
+            f"{entity_id}: {', '.join((data[entity_id]['possible_states'] or ['(no states seen)'])[:8])}"
+            for entity_id in resolved
+        ]
+        return {
+            "ok": True,
+            "facts": facts,
+            "data": {"entities": data},
+            "say_hint": "Use these real states in entity_state triggers/conditions; prefer from_state/to_state for 'when it changes' automations.",
+        }
 
     if tool == "automation_validate":
         errors, warnings = validate_definition(args.get("definition"), rc)
@@ -3654,6 +4263,11 @@ def _definition_form_supported(definition: Any) -> bool:
     """True when the form editor can round-trip this definition without losing capability."""
     if not isinstance(definition, dict):
         return False
+    trigger = definition.get("trigger")
+    if isinstance(trigger, dict) and _text(trigger.get("type")) == "entity_state":
+        # edge triggers with attribute matching exceed the form's single-action subset
+        if (_text(trigger.get("from_state")) or _text(trigger.get("to_state"))) and _text(trigger.get("attribute")):
+            return False
     actions = definition.get("actions")
     if not isinstance(actions, list) or len(actions) != 1:
         return False
@@ -3754,11 +4368,16 @@ def _definition_from_form(
         trigger: Dict[str, Any] = {"type": "interval", "seconds": _int(v("trigger_seconds", 60), 60, minimum=3, maximum=86400)}
     elif trigger_type == "entity_state":
         entity_id = _text(v("trigger_entity"))
+        if entity_id == _FORM_CUSTOM_SENTINEL:
+            entity_id = _text(v("trigger_entity_custom"))
         if not entity_id:
-            raise ValueError("Enter the Home Assistant entity to watch, e.g. switch.stove.")
+            raise ValueError("Choose the device to watch, or pick 'Custom entity ID…' and type an entity id.")
         trigger = {"type": "entity_state", "entity": entity_id}
-        attribute = _text(v("trigger_attribute"))
-        if attribute:
+        trigger_mode = _token(v("trigger_mode", "hold")) or "hold"
+        if trigger_mode == "attribute":
+            attribute = _text(v("trigger_attribute"))
+            if not attribute:
+                raise ValueError("Enter the attribute to match, e.g. current_temperature.")
             match = _token(v("trigger_match", "equals")) or "equals"
             if match not in ENTITY_MATCH_OPS:
                 match = "equals"
@@ -3768,14 +4387,30 @@ def _definition_from_form(
             trigger["attribute"] = attribute
             trigger["match"] = match
             trigger["value"] = value
+        elif trigger_mode == "change":
+            from_state = _text(v("trigger_from_state"))
+            to_state = _text(v("trigger_to_state"))
+            if from_state == _FORM_CUSTOM_SENTINEL:
+                from_state = ""
+            if to_state == _FORM_CUSTOM_SENTINEL:
+                to_state = ""
+            if from_state:
+                trigger["from_state"] = from_state
+            if to_state:
+                trigger["to_state"] = to_state
+            edge_for_seconds = _int(v("trigger_edge_for_seconds", 0), 0, minimum=0, maximum=86400)
+            if edge_for_seconds:
+                trigger["for_seconds"] = edge_for_seconds
         else:
             state = _text(v("trigger_state"))
+            if state == _FORM_CUSTOM_SENTINEL:
+                state = _text(v("trigger_state_custom"))
             if not state:
-                raise ValueError("Enter the state that should trigger, e.g. on or off.")
+                raise ValueError("Choose the state that should trigger, e.g. on or off.")
             trigger["state"] = state
-        for_seconds = _int(v("trigger_for_seconds", 0), 0, minimum=0, maximum=86400)
-        if for_seconds:
-            trigger["for_seconds"] = for_seconds
+            for_seconds = _int(v("trigger_for_seconds", 0), 0, minimum=0, maximum=86400)
+            if for_seconds:
+                trigger["for_seconds"] = for_seconds
     elif trigger_type == "time":
         if _hhmm_to_minutes(v("trigger_time")) is None:
             raise ValueError("Enter the time in 24-hour format, e.g. 07:30.")
@@ -3795,8 +4430,10 @@ def _definition_from_form(
         condition_type = _token(v(f"{prefix}type", "none")) or "none"
         if condition_type == "entity_state":
             entity_id = _text(v(f"{prefix}entity"))
+            if entity_id == _FORM_CUSTOM_SENTINEL:
+                entity_id = _text(v(f"{prefix}entity_custom"))
             if not entity_id:
-                raise ValueError(f"Condition {index}: enter the entity to check.")
+                raise ValueError(f"Condition {index}: choose the device to check.")
             condition = {"type": "entity_state", "entity": entity_id}
             attribute = _text(v(f"{prefix}attribute"))
             if attribute:
@@ -3809,8 +4446,10 @@ def _definition_from_form(
                 condition["value"] = value
             else:
                 state = _text(v(f"{prefix}state"))
+                if state == _FORM_CUSTOM_SENTINEL:
+                    state = _text(v(f"{prefix}state_custom"))
                 if not state:
-                    raise ValueError(f"Condition {index}: enter the state to require.")
+                    raise ValueError(f"Condition {index}: choose the state to require.")
                 condition["state"] = state
             for_seconds = _int(v(f"{prefix}for_seconds", 0), 0, minimum=0, maximum=86400)
             if for_seconds:
@@ -4117,6 +4756,51 @@ def _editor_fields(
     show = lambda key, equals: {"show_when": {"source_key": key, "equals": equals}}  # noqa: E731
     show_any = lambda key, options: {"show_when": {"source_key": key, "any_of": list(options)}}  # noqa: E731
 
+    entity_rows = _ha_entities(client)
+    watched_entities = _definition_watch_entities(definition)
+    entity_options = _ha_entity_options(client, rows=entity_rows, current_values=watched_entities)
+    dep_entity_ids = [row.get("value", "") for row in entity_options]
+    if len(dep_entity_ids) > 400:
+        # keep the payload bounded on very large HA instances: narrow state options
+        # to the entities this definition actually watches
+        dep_entity_ids = watched_entities
+    ensure_map: Dict[str, List[str]] = {}
+    spec_list: List[Any] = [trigger]
+    raw_conditions = definition.get("conditions")
+    if isinstance(raw_conditions, list):
+        spec_list.extend(spec for spec in raw_conditions if isinstance(spec, dict))
+    for spec in spec_list:
+        if not isinstance(spec, dict) or _text(spec.get("type")) != "entity_state":
+            continue
+        values = ensure_map.setdefault(_text(spec.get("entity")), [])
+        for key in ("state", "from_state", "to_state"):
+            token = _text(spec.get(key))
+            if token and token not in values:
+                values.append(token)
+    dep_any_base = _entity_state_dependency(
+        client,
+        dep_entity_ids,
+        source_key="",
+        empty_label="Any state",
+        fallback_default=[{"value": "", "label": "Any state"}],
+        ensure=ensure_map,
+        rows=entity_rows,
+    )
+    dep_state_base = _entity_state_dependency(
+        client,
+        dep_entity_ids,
+        source_key="",
+        fallback_default=[{"value": _FORM_CUSTOM_SENTINEL, "label": "Type a state…"}],
+        ensure=ensure_map,
+        rows=entity_rows,
+    )
+    trigger_mode = (
+        "attribute"
+        if _text(trigger.get("attribute"))
+        else ("change" if (_text(trigger.get("from_state")) or _text(trigger.get("to_state"))) else "hold")
+    )
+    activity_hint = _entity_activity_hint(client, _text(trigger.get("entity")), rows=entity_rows)
+
     fields: List[Dict[str, Any]] = [
         {"key": "heading_basics", "label": "1. Basics", "type": "section_heading"},
         {
@@ -4184,44 +4868,80 @@ def _editor_fields(
         },
         {
             "key": "trigger_entity",
-            "label": "Entity ID",
-            "type": "text",
+            "label": "Device",
+            "type": "select",
+            "options": [{"value": "", "label": "Choose a device…"}] + entity_options + [{"value": _FORM_CUSTOM_SENTINEL, "label": "Custom entity ID…"}],
             "value": _text(trigger.get("entity")),
             "full_width": True,
-            "description": "e.g. switch.stove or sensor.living_room_temperature",
             **show("trigger_type", "entity_state"),
+        },
+        {
+            "key": "trigger_entity_custom",
+            "label": "Entity ID",
+            "type": "text",
+            "value": "",
+            "placeholder": "sensor.washer",
+            **show("trigger_entity", _FORM_CUSTOM_SENTINEL),
+        },
+        {
+            "key": "trigger_mode",
+            "label": "What should happen?",
+            "type": "select",
+            "presentation": "cards",
+            "full_width": True,
+            "value": trigger_mode,
+            "options": [
+                {"value": "change", "label": "It changes", "description": "Fire once when the state changes (from → to).", "icon": "⇄"},
+                {"value": "hold", "label": "It has a state", "description": "Fire while the state matches.", "icon": "◼"},
+                {"value": "attribute", "label": "Advanced", "description": "Match an attribute like temperature or brightness.", "icon": "⚙"},
+            ],
+            "description": activity_hint or "States come from this device's history — pick one, or choose 'Custom entity ID…' for anything else.",
+            **show("trigger_type", "entity_state"),
+        },
+        {
+            "key": "trigger_from_state",
+            "label": "From state",
+            "type": "select",
+            "options": [],
+            "dependent_options": dict(dep_any_base, source_key="trigger_entity"),
+            "value": _text(trigger.get("from_state")),
+            **show_any("trigger_mode", ("change",)),
+        },
+        {
+            "key": "trigger_to_state",
+            "label": "To state",
+            "type": "select",
+            "options": [],
+            "dependent_options": dict(dep_any_base, source_key="trigger_entity"),
+            "value": _text(trigger.get("to_state")),
+            "description": "Both 'Any state' = fire on every change",
+            **show_any("trigger_mode", ("change",)),
+        },
+        {
+            "key": "trigger_edge_for_seconds",
+            "label": "Hold the new state for (seconds)",
+            "type": "number",
+            "min": 0,
+            "max": 86400,
+            "value": _int(trigger.get("for_seconds"), 0) if trigger_mode == "change" else 0,
+            "description": "0 = fire immediately on the change",
+            **show_any("trigger_mode", ("change",)),
         },
         {
             "key": "trigger_state",
             "label": "State",
-            "type": "text",
-            "value": _text(trigger.get("state")),
-            "description": "e.g. on, off, open — leave blank to match an attribute instead",
-            **show("trigger_type", "entity_state"),
-        },
-        {
-            "key": "trigger_attribute",
-            "label": "Attribute (optional)",
-            "type": "text",
-            "value": _text(trigger.get("attribute")),
-            "description": "Attribute path to check instead of the state, e.g. current_temperature",
-            **show("trigger_type", "entity_state"),
-        },
-        {
-            "key": "trigger_match",
-            "label": "Attribute match",
             "type": "select",
-            "value": _token(trigger.get("match")) or "equals",
-            "options": _match_options(),
-            **show("trigger_type", "entity_state"),
+            "options": [],
+            "dependent_options": dict(dep_state_base, source_key="trigger_entity"),
+            "value": _text(trigger.get("state")),
+            **show_any("trigger_mode", ("hold",)),
         },
         {
-            "key": "trigger_value",
-            "label": "Value",
+            "key": "trigger_state_custom",
+            "label": "State (type it)",
             "type": "text",
-            "value": _text(trigger.get("value")),
-            "description": "State or attribute value to compare against",
-            **show("trigger_type", "entity_state"),
+            "value": "",
+            **show("trigger_state", _FORM_CUSTOM_SENTINEL),
         },
         {
             "key": "trigger_for_seconds",
@@ -4229,9 +4949,33 @@ def _editor_fields(
             "type": "number",
             "min": 0,
             "max": 86400,
-            "value": _int(trigger.get("for_seconds"), 0),
+            "value": _int(trigger.get("for_seconds"), 0) if trigger_mode == "hold" else 0,
             "description": "0 = run as soon as it becomes true",
-            **show("trigger_type", "entity_state"),
+            **show_any("trigger_mode", ("hold",)),
+        },
+        {
+            "key": "trigger_attribute",
+            "label": "Attribute",
+            "type": "text",
+            "value": _text(trigger.get("attribute")),
+            "description": "Attribute path to check instead of the state, e.g. current_temperature",
+            **show_any("trigger_mode", ("attribute",)),
+        },
+        {
+            "key": "trigger_match",
+            "label": "Attribute match",
+            "type": "select",
+            "value": _token(trigger.get("match")) or "equals",
+            "options": _match_options(),
+            **show_any("trigger_mode", ("attribute",)),
+        },
+        {
+            "key": "trigger_value",
+            "label": "Value",
+            "type": "text",
+            "value": _text(trigger.get("value")),
+            "description": "State or attribute value to compare against",
+            **show_any("trigger_mode", ("attribute",)),
         },
         {
             "key": "trigger_time",
@@ -4293,18 +5037,35 @@ def _editor_fields(
             [
                 {
                     "key": f"{prefix}entity",
-                    "label": "Entity ID",
-                    "type": "text",
+                    "label": "Device",
+                    "type": "select",
+                    "options": [{"value": "", "label": "Choose a device…"}] + entity_options + [{"value": _FORM_CUSTOM_SENTINEL, "label": "Custom entity ID…"}],
                     "value": _text(raw.get("entity")),
                     "full_width": True,
                     **gate("entity_state"),
                 },
                 {
+                    "key": f"{prefix}entity_custom",
+                    "label": "Entity ID",
+                    "type": "text",
+                    "value": "",
+                    **show(f"{prefix}entity", _FORM_CUSTOM_SENTINEL),
+                },
+                {
                     "key": f"{prefix}state",
                     "label": "State",
-                    "type": "text",
+                    "type": "select",
+                    "options": [],
+                    "dependent_options": dict(dep_state_base, source_key=f"{prefix}entity"),
                     "value": _text(raw.get("state")),
                     **gate("entity_state"),
+                },
+                {
+                    "key": f"{prefix}state_custom",
+                    "label": "State (type it)",
+                    "type": "text",
+                    "value": "",
+                    **show(f"{prefix}state", _FORM_CUSTOM_SENTINEL),
                 },
                 {
                     "key": f"{prefix}attribute",
@@ -5139,7 +5900,18 @@ def handle_htmlui_tab_action(
     automations = _load_automations(rc)
     if action == "ga_refresh_devices":
         _registry(rc, refresh=True)
-        return {"ok": True, "message": "Integration devices refreshed."}
+        refreshed = 0
+        try:
+            watched = _automation_entities(automations)
+            if not watched:
+                watched = sorted(_ha_entities(rc))[:50]
+            refreshed = _refresh_state_catalog(rc, watched)
+        except Exception as exc:
+            logger.warning("state catalog refresh during ga_refresh_devices failed: %s", exc)
+        message = "Integration devices refreshed."
+        if refreshed:
+            message += f" State history updated for {refreshed} device(s)."
+        return {"ok": True, "message": message}
     if action == "ga_create_automation":
         try:
             definition = _definition_from_form(values, payload, client=rc)
