@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -158,6 +158,10 @@ ENTITY_STATES_KEY = f"{MODULE_KEY}:entity_states"
 UI_STATE_KEY = f"{MODULE_KEY}:ui_state"
 JOURNAL_KEY = f"{MODULE_KEY}:journal"
 JOURNAL_META_KEY = f"{MODULE_KEY}:journal_meta"
+PERSONS_KEY = f"{MODULE_KEY}:persons"
+SUGGESTIONS_KEY = f"{MODULE_KEY}:suggestions"
+FEEDBACK_KEY = f"{MODULE_KEY}:feedback"
+REFLECTION_STATE_KEY = f"{MODULE_KEY}:reflection_state"
 
 LEAF_ACTION_TYPES = ("call_service", "announce", "notify", "wait", "webhook")
 ALL_ACTION_TYPES = ("ask_yes_no", "camera_ai", "device", *LEAF_ACTION_TYPES)
@@ -416,6 +420,72 @@ CORE_SETTINGS = {
             "type": "number",
             "default": 2000,
             "description": "Ring-buffer size of the entity-state-change journal.",
+        },
+        "reflection_interval_seconds": {
+            "label": "Reflection interval (seconds)",
+            "type": "number",
+            "default": 21600,
+            "description": "Base interval between reflection passes (default 6h; the quiet-home gate skips passes with nothing to reflect on). 0 disables reflection. The cadence adapts: it doubles after idle or all-declined passes and returns to this base after an approval.",
+        },
+        "reflection_interval_max_seconds": {
+            "label": "Reflection interval ceiling (seconds)",
+            "type": "number",
+            "default": 86400,
+            "description": "Upper bound for the adaptive reflection interval.",
+        },
+        "max_pending_suggestions": {
+            "label": "Max pending suggestions",
+            "type": "number",
+            "default": 10,
+            "description": "When the pending queue exceeds this, the oldest pending suggestion is dropped to keep the queue reviewable.",
+        },
+        "suggestion_ttl_hours": {
+            "label": "Suggestion expiry (hours)",
+            "type": "number",
+            "default": 168,
+            "description": "Pending suggestions older than this are marked expired and stop counting against the queue cap.",
+        },
+        "suggestion_notify_daily_cap": {
+            "label": "Suggestion notifications per day",
+            "type": "number",
+            "default": 3,
+            "description": "Daily cap on chat notifications for new suggestion batches (you-approval flushes are exempt).",
+        },
+        "suggestion_max_defer_hours": {
+            "label": "Max presence-defer hours",
+            "type": "number",
+            "default": 12,
+            "description": "Presence-aware suggestions waiting for the right person are force-delivered after this many hours.",
+        },
+        "suggestion_presence_check_seconds": {
+            "label": "Presence re-check interval (seconds)",
+            "type": "number",
+            "default": 300,
+            "description": "Minimum time between camera/BLE presence checks per person during delivery flushes.",
+        },
+        "suggestion_presence_delivery": {
+            "label": "Presence-aware suggestion delivery",
+            "type": "text",
+            "default": "",
+            "description": "JSON list of per-person delivery rows: [{\"person\": \"Name\", \"tracker\": \"BLE tracker name\", \"camera\": \"camera entity\", \"camera_mode\": \"any_person|named\", \"lookback_seconds\": 3600, \"targets\": [\"notify target\"]}]. Empty disables presence-aware delivery.",
+        },
+        "suggestion_window_enabled": {
+            "label": "Suggestion window enabled",
+            "type": "bool",
+            "default": False,
+            "description": "Deliver new suggestions only inside a daily quiet window (off = deliver immediately).",
+        },
+        "suggestion_window_after": {
+            "label": "Suggestion window starts",
+            "type": "text",
+            "default": "09:00",
+            "description": "Local time (HH:MM) the suggestion window opens.",
+        },
+        "suggestion_window_before": {
+            "label": "Suggestion window ends",
+            "type": "text",
+            "default": "21:00",
+            "description": "Local time (HH:MM) the suggestion window closes.",
         },
     },
 }
@@ -3029,6 +3099,10 @@ def validate_definition(definition: Any, client: Any = None) -> Tuple[List[str],
                 warnings.append(
                     f"{label}: camera_face named mode needs Face ID — falling back to any-person behavior at run time"
                 )
+        if condition_type == "camera_face" and mode == "named" and _text(condition.get("person")):
+            catalog_warning = _person_catalog_warning(client, condition.get("person"), "camera_face person")
+            if catalog_warning:
+                warnings.append(f"{label}: {catalog_warning}")
         if condition_type == "presence" and not _text(condition.get("tracker")):
             errors.append(f"{label}: presence requires 'tracker'")
         if condition_type == "time_window":
@@ -4037,6 +4111,943 @@ def _trigger_due(
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# persons catalog (§15.6.7 — Phase 3, v1.4.0)
+# ---------------------------------------------------------------------------
+
+def _load_persons(client: Any = None) -> Dict[str, Dict[str, Any]]:
+    """person_id → {"name", "trackers": [...], "face_name", "targets"}."""
+    rc = client if client is not None else _redis()
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        raw = rc.hgetall(PERSONS_KEY) or {}
+        for person_id, blob in raw.items():
+            row = _json_loads(blob, {})
+            if isinstance(row, dict) and _text(row.get("name")):
+                out[str(person_id)] = row
+    except Exception:
+        logger.debug("persons catalog read failed")
+    return out
+
+
+def _person_names(client: Any = None) -> List[str]:
+    return sorted({_text(row.get("name")) for row in _load_persons(client).values()})
+
+
+def _person_catalog_warning(client: Any, person_text: Any, field_label: str = "person") -> str:
+    """Soft autocomplete warning (never a block): unknown free text when the
+    catalog actually has entries."""
+    names = _person_names(client)
+    if not names:
+        return ""
+    wanted = _text(person_text)
+    if not wanted:
+        return ""
+    if str(wanted).lower() in {n.lower() for n in names}:
+        return ""
+    return (
+        f"{field_label} '{wanted}' is not in the Persons catalog — check spelling "
+        "or add the person under Generative Agent › Persons"
+    )
+
+
+def _tracker_options(current_values: Any = None) -> List[Dict[str, str]]:
+    tracks = _presence_trackers()
+    rows = [{"value": _text(name), "label": _text(name)} for name in tracks if _text(name)]
+    for token in _list(current_values):
+        label = _text(token)
+        if label and not any(row.get("value") == label for row in rows):
+            rows.append({"value": label, "label": f"{label} (saved)"})
+    return rows
+
+
+def _person_fields(row: Dict[str, Any], rc: Any) -> List[Dict[str, Any]]:
+    name = _text(row.get("name"))
+    trackers = _list(row.get("trackers"))
+    return [
+        {
+            "key": "person_name",
+            "label": "Name",
+            "type": "text",
+            "value": name,
+            "description": "A short label, e.g. 'Alex'.",
+        },
+        {
+            "key": "person_trackers",
+            "label": "BLE trackers",
+            "type": "multiselect",
+            "value": trackers,
+            "options": _tracker_options(trackers),
+            "description": "This person's presence trackers. Names come from the BLE presence engine; entries not shown can be written in chat.",
+        },
+        {
+            "key": "person_face_name",
+            "label": "Face ID name",
+            "type": "text",
+            "value": _text(row.get("face_name")),
+            "description": "Must match how the Face ID engine names this person (used by named camera conditions).",
+        },
+        {
+            "key": "person_targets",
+            "label": "Default notification target",
+            "type": "text",
+            "value": _text(row.get("targets")),
+            "description": "Where this person's personalized notifications go (comma-separated targets); empty uses the core default.",
+        },
+    ]
+
+
+def _person_card(person_id: str, row: Dict[str, Any], rc: Any) -> Dict[str, Any]:
+    name = _text(row.get("name")) or person_id
+    trackers = _list(row.get("trackers"))
+    return {
+        "id": person_id,
+        "group": "persons",
+        "title": name,
+        "summary_rows": [
+            {"label": "Trackers", "value": ", ".join(_text(t) for t in trackers) or "—"},
+            {"label": "Face name", "value": _text(row.get("face_name")) or "—"},
+            {"label": "Notify to", "value": _text(row.get("targets")) or "Default target"},
+        ],
+        "save_action": "ga_person_save",
+        "save_label": "Save person",
+        "settings_label": "Edit Person",
+        "fields": _person_fields(row, rc),
+        "remove_action": "ga_person_delete",
+        "remove_label": "Delete person",
+        "remove_confirm": f"Delete person '{name}' from the catalog?",
+    }
+
+
+def _suggestion_card(suggestion_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    definition = row.get("definition") if isinstance(row.get("definition"), dict) else {}
+    kind = _text(row.get("kind")) or "create"
+    status = _text(row.get("status")) or "pending"
+    name = _text(definition.get("name")) or (_text(row.get("rationale"))[:48] or suggestion_id)
+    target_label = _text(row.get("target_id"))
+    summary_rows = [
+        {"label": "Proposes", "value": "New automation" if kind == "create" else f"Change to automation {target_label or '?'}"},
+        {"label": "Trigger", "value": _trigger_label(definition.get("trigger"))},
+        {"label": "Action", "value": _action_label(definition.get("actions"))},
+        {"label": "Confidence", "value": _text(row.get("confidence")) or "medium"},
+    ]
+    item: Dict[str, Any] = {
+        "id": suggestion_id,
+        "group": "suggestions",
+        "title": name,
+        "detail": _text(row.get("rationale")),
+        "summary_rows": summary_rows,
+        "hero_badges": [
+            {"label": status.title(), "tone": {"pending": "paused"}.get(status, "muted")},
+        ],
+        "actions": [
+            {"action": "ga_suggestion_approve", "label": "Approve", "tone": "run", "payload": {"id": suggestion_id}},
+            {"action": "ga_suggestion_decline", "label": "Decline", "tone": "danger", "payload": {"id": suggestion_id}},
+        ],
+        "sections": [
+            {
+                "label": "Proposal",
+                "fields": [
+                    {"key": "suggestion_rationale", "label": "Why (rationale)", "type": "textarea", "read_only": True, "value": _text(row.get("rationale"))},
+                    {"key": "suggestion_definition", "label": "Definition (JSON)", "type": "textarea", "read_only": True, "value": json.dumps(definition, indent=2, default=str)},
+                ],
+            }
+        ],
+    }
+    pending_only = status == "pending"
+    if not pending_only:
+        item.pop("actions", None)
+    return item
+
+
+def _add_person_card(rc: Any) -> Dict[str, Any]:
+    return {
+        "id": "add_person",
+        "group": "persons",
+        "title": "Add a person",
+        "detail": "The catalog gives 'person' a home: presence rows and named camera conditions reference these entries by name.",
+        "save_action": "ga_person_save",
+        "save_label": "Add person",
+        "settings_label": "Add Person",
+        "fields": _person_fields({}, rc),
+    }
+
+
+# ---------------------------------------------------------------------------
+# suggestions: storage, delivery, approval (§15.6.3–15.6.4 — Phase 3, v1.4.0)
+# ---------------------------------------------------------------------------
+
+SUGGESTION_STATUSES = ("pending", "approved", "declined", "expired")
+
+
+def _load_suggestions(client: Any = None) -> Dict[str, Dict[str, Any]]:
+    """suggestion_id → row. Rows keep insertion order via their ts."""
+    rc = client if client is not None else _redis()
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        raw = rc.hgetall(SUGGESTIONS_KEY) or {}
+        for suggestion_id, blob in raw.items():
+            row = _json_loads(blob, {})
+            if isinstance(row, dict):
+                out[str(suggestion_id)] = row
+    except Exception:
+        logger.debug("suggestions read failed")
+    return out
+
+
+def _save_suggestion(client: Any, suggestion_id: str, row: Dict[str, Any]) -> None:
+    rc = client if client is not None else _redis()
+    rc.hset(SUGGESTIONS_KEY, suggestion_id, json.dumps(row, separators=(",", ":"), default=str))
+
+
+def _log_feedback(client: Any, kind: str, automation_id: str, detail: str) -> None:
+    """Small trimmed feedback list: nuisance/annoyance signals, declined suggestions."""
+    rc = client if client is not None else _redis()
+    try:
+        row = {
+            "ts": time.time(),
+            "ts_text": _now_iso(),
+            "automation_id": _text(automation_id),
+            "kind": _text(kind) or "note",
+            "detail": _text(detail),
+        }
+        rc.lpush(FEEDBACK_KEY, json.dumps(row, separators=(",", ":"), default=str))
+        rc.ltrim(FEEDBACK_KEY, 0, 199)
+    except Exception:
+        logger.debug("feedback log failed")
+
+
+def _read_feedback(client: Any, limit: int = 50) -> List[Dict[str, Any]]:
+    rc = client if client is not None else _redis()
+    try:
+        raw = rc.lrange(FEEDBACK_KEY, 0, max(0, limit - 1)) or []
+    except Exception:
+        return []
+    rows: List[Dict[str, Any]] = []
+    for blob in raw:
+        row = blob if isinstance(blob, dict) else _json_loads(blob, {})
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _declined_digest(client: Any, limit: int = 10) -> List[str]:
+    """One-line compact rows for the reflection prompt's declined list (G4)."""
+    lines: List[str] = []
+    for row in _read_feedback(client, limit=120):
+        if _text(row.get("kind")) != "decline":
+            continue
+        detail = _text(row.get("detail"))
+        lines.append(detail if detail else "(declined suggestion)")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _feedback_sentiment(client: Any, limit: int = 20) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in _read_feedback(client, limit=limit) or []:
+        kind = _text(row.get("kind"))
+        if kind:
+            counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def _suggestion_expiry_seconds(rc: Any) -> float:
+    return max(1.0, _as_float(_setting(rc, "suggestion_ttl_hours", 168.0), 168.0) * 3600.0)
+
+
+def _expire_suggestions(rc: Any) -> int:
+    """Pending suggestions past their TTL flip to expired. Returns count."""
+    now = time.time()
+    expired = 0
+    for suggestion_id, row in _load_suggestions(rc).items():
+        if _text(row.get("status")) != "pending":
+            continue
+        if _as_float(row.get("ts"), 0.0) + _suggestion_expiry_seconds(rc) <= now:
+            row["status"] = "expired"
+            _save_suggestion(rc, suggestion_id, row)
+            expired += 1
+            _log_activity(rc, "", _text(row.get("definition", {}).get("name") or "suggestion"),
+                          "suggestion expired", _text(row.get("rationale"))[:120])
+    return expired
+
+
+def _cap_pending_suggestions(rc: Any) -> int:
+    """Drop the oldest pending suggestions beyond the queue cap (activity row each)."""
+    cap = max(1, _as_int(_setting(rc, "max_pending_suggestions", 10), 10))
+    pending = sorted(
+        (row for row in _load_suggestions(rc).items() if _text(row[1].get("status")) == "pending"),
+        key=lambda item: _as_float(item[1].get("ts"), 0.0),
+    )
+    dropped = 0
+    for suggestion_id, row in pending[:-cap] if len(pending) > cap else []:
+        row["status"] = "expired"
+        _save_suggestion(rc, suggestion_id, row)
+        _log_activity(rc, "", _text(row.get("definition", {}).get("name") or "suggestion"),
+                      "suggestion dropped", "queue full — oldest pending suggestion capped")
+        dropped += 1
+    return dropped
+
+
+def _suggestion_window_settings(rc: Any = None) -> Tuple[bool, str, str]:
+    client = rc if rc is not None else _redis()
+    enabled = _bool(_setting(client, "suggestion_window_enabled", False), False)
+    after = _text(_setting(client, "suggestion_window_after", ""))
+    before = _text(_setting(client, "suggestion_window_before", ""))
+    return enabled, after, before
+
+
+def _suggestion_delivery_open(rc: Any) -> bool:
+    """G-window: notifications only inside the configured window; outside → defer."""
+    enabled, after, before = _suggestion_window_settings(rc)
+    if not enabled or (not after and not before):
+        return True
+    return _time_window_open(after, before)
+
+
+def _notify_daily_budget_state(rc: Any) -> Dict[str, Any]:
+    try:
+        state = _json_loads(rc.get(REFLECTION_STATE_KEY) or "{}", {})
+    except Exception:
+        state = {}
+    counts = state.get("notify_counts") if isinstance(state.get("notify_counts"), dict) else {}
+    today = datetime.now().strftime("%Y-%m-%d")
+    return state, counts, today
+
+
+def _notify_budget_add(rc: Any) -> None:
+    state, counts, today = _notify_daily_budget_state(rc)
+    counts[today] = counts.get(today, 0) + 1
+    state["notify_counts"] = {k: v for k, v in counts.items() if k >= today}
+    try:
+        rc.set(REFLECTION_STATE_KEY, json.dumps(state, separators=(",", ":"), default=str))
+    except Exception:
+        logger.debug("reflection state write failed")
+
+
+def _notify_budget_spent(rc: Any) -> bool:
+    cap = max(0, _as_int(_setting(rc, "suggestion_notify_daily_cap", 3), 3))
+    if cap == 0:
+        return False
+    _state, counts, today = _notify_daily_budget_state(rc)
+    return counts.get(today, 0) >= cap
+
+
+def _notification_target_for(row: Dict[str, Any], rc: Any) -> Optional[Any]:
+    targets = _text(row.get("targets"))
+    if not targets:
+        return None
+    return [t for t in (part.strip() for part in targets.split(",")) if t]
+
+
+def _dispatch_suggestion_notify(rc: Any, title: str, content: str, targets: Optional[Any], count_add: bool = True) -> bool:
+    try:
+        from notify.core import dispatch_notification_sync
+
+        result = dispatch_notification_sync("webui", title, content, targets=targets,
+                                            origin="automation_ga_core")
+        ok = isinstance(result, dict) and result.get("ok") is not False
+        if ok and count_add:
+            _notify_budget_add(rc)
+        return ok
+    except Exception as exc:
+        logger.debug("suggestion notification failed: %s", exc)
+        return False
+
+
+def _store_new_suggestions(rc: Any, proposals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate, store and deliver one reflection batch. Returns stored rows."""
+    now = time.time()
+    now_text = _now_iso()
+    stored: List[Dict[str, Any]] = []
+    for proposal in proposals:
+        try:
+            row = {
+                "suggestion_id": f"s_{uuid.uuid4().hex[:8]}",
+                "ts": round(now, 3),
+                "ts_text": now_text,
+                "kind": _token(proposal.get("kind")) or "create",
+                "target_id": _text(proposal.get("target_id")),
+                "rationale": _text(proposal.get("rationale"))[:400],
+                "confidence": _token(proposal.get("confidence")) or "medium",
+                "definition": proposal.get("definition") if isinstance(proposal.get("definition"), dict) else {},
+                "status": "pending",
+                "delivered": False,
+                "copies": {},
+                "declined_ts": None,
+            }
+            if row["kind"] == "update":
+                if not row["target_id"]:
+                    logger.debug("suggestion dropped: update without target_id")
+                    continue
+            errors, _warnings = validate_definition(row["definition"], rc)
+            if errors:
+                logger.info("[automation_ga] suggestion %s rejected: %s", row["suggestion_id"], "; ".join(errors))
+                continue
+            _save_suggestion(rc, row["suggestion_id"], row)
+            stored.append(row)
+        except Exception:
+            logger.exception("suggestion store failed")
+    if stored:
+        _cap_pending_suggestions(rc)
+        _deliver_suggestion_batch(rc, [row["suggestion_id"] for row in stored])
+    return stored
+
+
+def _presence_rows_configured(rc: Any) -> List[Dict[str, Any]]:
+    """suggestion_presence_delivery rows, validated: person + at least one signal."""
+    raw = _setting(rc, "suggestion_presence_delivery", None)
+    rows_out: List[Dict[str, Any]] = []
+    if isinstance(raw, str) and raw.strip():
+        raw = _json_loads(raw, None)
+    if not isinstance(raw, list):
+        return rows_out
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        person = _text(row.get("person"))
+        tracker = _text(row.get("tracker"))
+        camera = _text(row.get("camera"))
+        if not person or not (tracker or camera):
+            continue
+        mode = _token(row.get("camera_mode")) if camera else ""
+        if camera and mode not in ("", "any_person", "named"):
+            continue
+        lookback = max(15.0, _as_float(row.get("lookback_seconds"), 600.0))
+        if camera and mode == "named":
+            readiness = _camera_face_id_readiness(rc)
+            if readiness.get("status") != "ready":
+                logger.debug("presence row '%s' face-id not ready — degrading to any-person", person)
+                mode = "any_person"
+        rows_out.append({
+            "person": person,
+            "tracker": tracker,
+            "camera": camera,
+            "camera_mode": mode if camera else "",
+            "lookback_seconds": lookback,
+            "targets": _text(row.get("targets")),
+        })
+    return rows_out
+
+
+def _presence_row_qualifies(rc: Any, row: Dict[str, Any]) -> Tuple[bool, str]:
+    """Evaluate one presence row's signals right now (no throttling here — the
+    caller owns the per-row check budget). Any one qualifying signal wins."""
+    tracker = _text(row.get("tracker"))
+    if tracker:
+        trackers = _presence_trackers()
+        if trackers.get(tracker.lower()) == "home":
+            return True, f"tracker '{tracker}' home"
+    camera = _text(row.get("camera"))
+    if camera:
+        camera_mode = _text(row.get("camera_mode")) or "any_person"
+        matched, detail, _name = _camera_person_check(
+            rc, camera, _text(row.get("person")) if camera_mode == "named" else "",
+            lookback_seconds=_as_float(row.get("lookback_seconds"), 600.0))
+        if matched:
+            return True, f"camera '{camera}' ({camera_mode}): {detail}"
+        return False, f"camera '{camera}': {detail}"
+    return False, f"tracker '{tracker}' away" if tracker else "no qualifying signal"
+
+
+def _deliver_suggestion_batch(rc: Any, suggestion_ids: List[str], force: bool = False) -> None:
+    """Delivery for one new batch (§15.6.3): with no presence rows, one summary
+    notification now or at first in-window tick; with presence rows, one
+    personalized deferred copy per person. G8 budget gates the immediate
+    summary only — flushes are bookkeeping."""
+    suggestions = _load_suggestions(rc)
+    rows = [suggestions.get(sid) for sid in suggestion_ids if isinstance(suggestions.get(sid), dict)]
+    rows = [row for row in rows if _text(row.get("status")) == "pending"]
+    if not rows:
+        return
+    presence_rows = _presence_rows_configured(rc)
+    if presence_rows:
+        for row in rows:
+            copies = row.get("copies") if isinstance(row.get("copies"), dict) else {}
+            changed = False
+            for presence_row in presence_rows:
+                person = _text(presence_row.get("person"))
+                if person in copies:
+                    continue
+                copies[person] = {
+                    "targets": _text(presence_row.get("targets")),
+                    "delivered": False,
+                    "queued_ts": time.time(),
+                }
+                changed = True
+            if changed:
+                row["copies"] = copies
+                _save_suggestion(rc, _text(row.get("suggestion_id")), row)
+        return
+    # no presence rows: immediate summary inside the window, queue otherwise
+    if not _suggestion_delivery_open(rc):
+        for row in rows:
+            row["delivery_queued"] = True
+            _save_suggestion(rc, _text(row.get("suggestion_id")), row)
+        return
+    if _notify_budget_spent(rc) and not force:
+        for row in rows:
+            row["delivery_queued"] = True
+            _save_suggestion(rc, _text(row.get("suggestion_id")), row)
+        return
+    count = len(rows)
+    lines = "\n".join(f"• {_text(row.get('rationale'))[:140]}" for row in rows[:5])
+    content = f"Generative Agent proposes {count} automation suggestion{'s' if count != 1 else ''}:\n{lines}"
+    ok = _dispatch_suggestion_notify(rc, "New automation suggestions", content, None, count_add=True)
+    for row in rows:
+        row["delivered"] = bool(ok)
+        row["delivery_queued"] = not ok
+        _save_suggestion(rc, _text(row.get("suggestion_id")), row)
+
+
+def _flush_suggestion_delivery(rc: Any) -> int:
+    """Tick-side flush (§15.6.3): window/budget-queued summaries and per-person
+    presence copies (throttled by suggestion_presence_check_seconds, hard-
+    flushed after suggestion_max_defer_hours). Flushes never count against the
+    G8 daily budget. Returns notifications sent."""
+    sent = 0
+    now = time.time()
+    suggestions = _load_suggestions(rc)
+    queue_rows = [row for row in suggestions.values()
+                  if row.get("delivery_queued") and _text(row.get("status")) == "pending"]
+    if queue_rows and _suggestion_delivery_open(rc):
+        count = len(queue_rows)
+        lines = "\n".join(f"• {_text(row.get('rationale'))[:140]}" for row in queue_rows[:5])
+        content = f"Generative Agent proposes {count} automation suggestion{'s' if count != 1 else ''}:\n{lines}"
+        ok = _dispatch_suggestion_notify(rc, "New automation suggestions", content, None, count_add=False)
+        for row in queue_rows:
+            row["delivered"] = bool(ok)
+            row["delivery_queued"] = False
+            _save_suggestion(rc, _text(row.get("suggestion_id")), row)
+        sent += 1 if ok else 0
+    presence_rows = _presence_rows_configured(rc)
+    if not presence_rows:
+        return sent
+    try:
+        state = _json_loads(rc.get(REFLECTION_STATE_KEY) or "{}", {}) or dict()
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
+    checks = state.get("presence_checks") if isinstance(state.get("presence_checks"), dict) else {}
+    spacing = max(10.0, _as_float(_setting(rc, "suggestion_presence_check_seconds", 300.0), 300.0))
+    max_defer = max(0.25, _as_float(_setting(rc, "suggestion_max_defer_hours", 12.0), 12.0))
+    per_person_lines: Dict[str, List[str]] = {}
+    per_person_targets: Dict[str, str] = {}
+    for presence_row in presence_rows:
+        person = _text(presence_row.get("person"))
+        eligible = [
+            row for row in suggestions.values()
+            if _text(row.get("status")) == "pending"
+            and isinstance(row.get("copies"), dict)
+            and isinstance(row["copies"].get(person), dict)
+            and not row["copies"][person].get("delivered")
+        ]
+        if not eligible:
+            continue
+        qualifies, detail = None, ""
+        state_key = f"presence:{person}"
+        if now - _as_float(checks.get(state_key), 0.0) >= spacing:
+            checks[state_key] = now
+            qualifies, detail = _presence_row_qualifies(rc, presence_row)
+        first_queued = min(
+            (_as_float(row["copies"][person].get("queued_ts"), 0.0) for row in eligible),
+            default=0.0,
+        )
+        defer_due = first_queued > 0 and now - first_queued >= max_defer * 3600.0
+        if qualifies is not True and not defer_due:
+            continue
+        per_person_lines[person] = [_text(row.get("rationale"))[:140] for row in eligible[:5]]
+        per_person_targets[person] = _text(presence_row.get("targets"))
+        delivered_detail = detail if qualifies is True else "deferred too long — flushed"
+        for row in eligible:
+            row["copies"][person]["delivered"] = True
+            row["delivered"] = True
+            _save_suggestion(rc, _text(row.get("suggestion_id")), row)
+        _log_activity(rc, "", "suggestions", "presence delivery",
+                      f"{person}: {len(eligible)} suggestion(s) — {delivered_detail}")
+    state["presence_checks"] = checks
+    try:
+        rc.set(REFLECTION_STATE_KEY, json.dumps(state, separators=(",", ":"), default=str))
+    except Exception:
+        logger.debug("reflection state write failed")
+    for person, lines in per_person_lines.items():
+        count = len(lines)
+        content = f"Generative Agent has {count} suggestion{'s' if count != 1 else ''} for you:\n" + "\n".join(f"• {line}" for line in lines)
+        ok = _dispatch_suggestion_notify(
+            rc, f"Automation suggestions — {person}", content,
+            _notification_target_for({"targets": per_person_targets.get(person, "")}, rc),
+            count_add=False,
+        )
+        sent += 1 if ok else 0
+    return sent
+
+
+def _approve_suggestion(client: Any, suggestion_id: str) -> Dict[str, Any]:
+    """Sentinel enforcement point (§15.6.4): the ONLY way a suggestion becomes
+    an automation. Re-validates, then walks the same create/update kernel-tool
+    paths — synchronous, no new concurrency on the automations hash."""
+    rc = client if client is not None else _redis()
+    row = _load_suggestions(rc).get(_text(suggestion_id))
+    if not row:
+        return {"ok": False, "message": f"Suggestion '{suggestion_id}' not found."}
+    if _text(row.get("status")) != "pending":
+        return {"ok": False, "message": f"Suggestion '{suggestion_id}' is {_text(row.get('status'))} — only pending suggestions can be approved."}
+    definition = row.get("definition") if isinstance(row.get("definition"), dict) else {}
+    errors, _warnings = validate_definition(definition, rc)
+    if errors:
+        return {"ok": False, "message": "Suggestion no longer validates: " + "; ".join(errors) + " — decline it instead."}
+    kind = _token(row.get("kind")) or "create"
+    if kind == "update":
+        target_id = _text(row.get("target_id"))
+        result = run_hydra_kernel_tool("automation_update", {"id": target_id, "definition": definition}, redis_client=rc)
+        if not result.get("ok"):
+            return {"ok": False, "message": "Suggestion update failed: " + _text((result.get("error") or {}).get("message"))}
+        _log_activity(rc, target_id, _text(definition.get("name")), "approved",
+                      f"updated from suggestion — {_text(row.get('rationale'))[:160]}")
+    else:
+        result = run_hydra_kernel_tool("automation_create", {"definition": definition}, redis_client=rc)
+        if not result.get("ok"):
+            return {"ok": False, "message": "Suggestion create failed: " + _text((result.get("error") or {}).get("message"))}
+        new_id = _text((result.get("data") or {}).get("id"))
+        _log_activity(rc, new_id, _text(definition.get("name")), "approved",
+                      f"created from suggestion — {_text(row.get('rationale'))[:160]}")
+    row["status"] = "approved"
+    row["approved_ts"] = time.time()
+    _save_suggestion(rc, _text(suggestion_id), row)
+    # an approval proves the cadence earned feedback — recovery halves the interval
+    try:
+        state = _json_loads(rc.get(REFLECTION_STATE_KEY) or "{}", {}) or {}
+        state["yielded"] = True
+        rc.set(REFLECTION_STATE_KEY, json.dumps(state, separators=(",", ":"), default=str))
+    except Exception:
+        logger.debug("reflection state write failed")
+    return {"ok": True, "message": f"Suggestion approved — automation '{_text(definition.get('name'))}' is ready.", "id": _text((result.get("data") or {}).get("id") or row.get("target_id"))}
+
+
+def _decline_suggestion(client: Any, suggestion_id: str) -> Dict[str, Any]:
+    rc = client if client is not None else _redis()
+    row = _load_suggestions(rc).get(_text(suggestion_id))
+    if not row:
+        return {"ok": False, "message": f"Suggestion '{suggestion_id}' not found."}
+    if _text(row.get("status")) != "pending":
+        return {"ok": False, "message": f"Suggestion '{suggestion_id}' is {_text(row.get('status'))}."}
+    row["status"] = "declined"
+    row["declined_ts"] = time.time()
+    _save_suggestion(rc, _text(suggestion_id), row)
+    definition = row.get("definition") if isinstance(row.get("definition"), dict) else {}
+    compact = json.dumps({
+        "kind": row.get("kind"),
+        "target": _text(row.get("target_id")),
+        "name": _text(definition.get("name")),
+        "trigger": _trigger_label(definition.get("trigger")),
+        "action": _action_label(definition.get("actions")),
+        "rationale": _text(row.get("rationale"))[:200],
+    }, separators=(",", ":"), default=str)
+    _log_feedback(rc, "decline", _text(row.get("target_id")), "declined suggestion: " + compact)
+    _log_activity(rc, "", _text(definition.get("name")) or "suggestion", "declined",
+                  _text(row.get("rationale"))[:160])
+    try:
+        state = _json_loads(rc.get(REFLECTION_STATE_KEY) or "{}", {}) or {}
+        state["declined_since_pass"] = _as_int(state.get("declined_since_pass"), 0) + 1
+        rc.set(REFLECTION_STATE_KEY, json.dumps(state, separators=(",", ":"), default=str))
+    except Exception:
+        logger.debug("reflection state write failed")
+    return {"ok": True, "message": "Suggestion declined — the agent avoids re-proposing it."}
+
+
+# ---------------------------------------------------------------------------
+# reflection pass → suggestion proposals (§15.6.1–15.6.2 — Phase 3, v1.4.0)
+# ---------------------------------------------------------------------------
+
+_REFLECTION_SYSTEM_PROMPT = (
+    "You are a home-automation advisor embedded in the Generative Agent core for Tater. "
+    "The runner executing rules is deterministic and only acts on approved automations — "
+    "you may not directly control devices. Given a record of recent home activity, the "
+    "existing automations and their outcomes, propose:\n"
+    "(a) 0-3 NEW automations that would genuinely help, and/or\n"
+    "(b) 0-2 CHANGES to existing ones (for example 'cooldown too short — it fired five "
+    "times while we were asleep').\n"
+    "Rules: reference only entities/devices present in the provided context; prefer "
+    "notifying over announcing (silent, no interruption); never repeat an automation the "
+    "user already declined (the declined list is included); rank candidates by expected "
+    "usefulness and emit only ones that clear a real bar — if the record shows nothing "
+    "worth acting on (no unaddressed pattern, nothing time-relevant, or only ideas close "
+    "to previously declined ones), an empty suggestions list is a valid and often correct "
+    "answer. Output ONLY JSON matching:\n"
+    '{"suggestions": [{"kind": "create"|"update", "target_id": "", "rationale": "one or '
+    'two sentences", "confidence": "low"|"medium"|"high", "definition": { ... full '
+    'automation definition in the provided schema ... }}]}'
+)
+_REFLECTION_TIMEOUT_SECONDS = 90.0
+
+
+def _reflection_state(rc: Any) -> Dict[str, Any]:
+    try:
+        state = _json_loads(rc.get(REFLECTION_STATE_KEY) or "{}", {}) or {}
+    except Exception:
+        state = {}
+    return state if isinstance(state, dict) else {}
+
+
+def _save_reflection_state(rc: Any, state: Dict[str, Any]) -> None:
+    try:
+        rc.set(REFLECTION_STATE_KEY, json.dumps(state, separators=(",", ":"), default=str))
+    except Exception:
+        logger.debug("reflection state write failed")
+
+
+def _activity_delta_since(rc: Any, since: float) -> bool:
+    """True when any journal, activity or feedback row is newer than `since`."""
+    if since <= 0:
+        return True
+    try:
+        for blob in (rc.lrange(JOURNAL_KEY, 0, 29) or []) + (rc.lrange(ACTIVITY_KEY, 0, 49) or []):
+            row = blob if isinstance(blob, dict) else _json_loads(blob, {})
+            if isinstance(row, dict) and _as_float(row.get("ts"), 0.0) > since:
+                return True
+        for row in _read_feedback(rc, limit=30):
+            if _as_float(row.get("ts"), 0.0) > since:
+                return True
+    except Exception:
+        return True  # fail open: a broken delta check must not silence the agent
+    return False
+
+
+def _reflection_due(rc: Any, now: Optional[float] = None) -> Tuple[bool, str]:
+    """Skip-gate (§15.6.1): plain code, no LLM. Every clause must pass. The first
+    failing clause is returned as the skip reason (also written to reflection_state
+    by the caller) so quietness is always explainable from state."""
+    now = now if now is not None else time.time()
+    base = _as_float(_setting(rc, "reflection_interval_seconds", 21600.0), 21600.0)
+    if base <= 0:
+        return False, "reflection disabled (reflection_interval_seconds=0)"
+    state = _reflection_state(rc)
+    interval = max(base, _as_float(state.get("interval_seconds"), base))
+    last_pass = _as_float(state.get("last_pass_ts"), 0.0)
+    if last_pass > 0 and now - last_pass < interval:
+        return False, f"interval not elapsed ({int(interval - (now - last_pass))}s remaining)"
+    if last_pass > 0 and not _activity_delta_since(rc, last_pass):
+        return False, "quiet since the last pass (no journal, activity or feedback rows)"
+    cap = max(1, _as_int(_setting(rc, "max_pending_suggestions", 10), 10))
+    pending = [row for row in _load_suggestions(rc).values() if _text(row.get("status")) == "pending"]
+    if len(pending) >= cap:
+        return False, f"suggestion queue full ({len(pending)} >= max_pending_suggestions={cap})"
+    flush_only = any(
+        row.get("delivery_queued") is True
+        or any(isinstance(copy, dict) and copy.get("delivered") is False
+               for copy in (row.get("copies") or {}).values())
+        for row in pending)
+    if _notify_budget_spent(rc) and not flush_only:
+        return False, "daily suggestion-notification budget spent"
+    if not flush_only:
+        deliverable = _suggestion_delivery_open(rc) or any(
+            _presence_row_qualifies(rc, row)[0] for row in _presence_rows_configured(rc))
+        if not deliverable:
+            return False, "delivery window closed and no presence row qualifies"
+    return True, ""
+
+
+def _build_reflection_prompt(rc: Any) -> Tuple[str, str]:
+    """Assemble the reflection context (§15.6.2): activity digest, existing
+    automations with their run stats, declined list, entity overview, targets."""
+    rc = rc if rc is not None else _redis()
+    digest = _activity_digest(rc)
+    automation_lines: List[str] = []
+    for auto_id, definition in sorted(_load_automations(rc).items(), key=lambda pair: _text(pair[1].get("name")).casefold()):
+        stats = (digest.get("automation_stats") or {}).get(_text(definition.get("name"))) or {}
+        built = [
+            f"- {auto_id}: {_text(definition.get('name')) or auto_id}",
+            f"  trigger: {_trigger_label(definition.get('trigger'))}",
+            f"  actions: {(_action_label(definition.get('actions')))}",
+            f"  enabled: {_automation_enabled(definition)}; cooldown: {_as_int(definition.get('cooldown_seconds'), 0)}s"
+            + ("; builtin" if definition.get("builtin") else ""),
+            f"  stats: runs={_as_int(stats.get('run_count'), 0)} unanswered={_as_int(stats.get('unanswered_count'), 0)}"
+            + (f" last_answer={stats.get('last_answer')}" if stats.get("last_answer") else ""),
+        ]
+        automation_lines.append("\n".join(line for line in built if line))
+    entity_lines = [
+        f"{entity_id} = {row.get('state')}"
+        for entity_id, row in sorted(_ha_entities(rc).items())[:80]
+    ]
+    digest_lines = [
+        f"journal changes (recent): {json.dumps(digest.get('recent_changes')[:20], default=str)}",
+        f"unavailable entities: {', '.join(digest.get('unavailable_entities', [])) or '(none)'}",
+        f"protect person events (24h): {json.dumps(digest.get('protect_person_events_24h'), default=str)}",
+    ]
+    declined_lines = _declined_digest(rc, limit=10)
+    sentiment = _feedback_sentiment(rc, limit=25)
+    registry = _registry(rc)
+    camera_rows = [f"{row.get('value')}" for row in _camera_device_options(registry)[:25]]
+    sat_rows = [f"{row.get('value')}" for row in _announcement_options()[:20]]
+    notify_rows = _ha_notify_services(rc)[:20]
+    user_prompt = f"""HOME RECORD (times are local, epoch seconds for comparison)
+
+EXISTING AUTOMATIONS:
+{chr(10).join(automation_lines) if automation_lines else "(none — the home has no automations yet)"}
+
+RECENT HOME ACTIVITY:
+{chr(10).join(digest_lines)}
+
+ENTITIES (entity_id = state):
+{chr(10).join(entity_lines) if entity_lines else "(none cached yet)"}
+
+CAMERAS: {', '.join(camera_rows) if camera_rows else '(none)'}
+ANNOUNCE TARGETS: {', '.join(sat_rows) if sat_rows else '(none)'}
+NOTIFY SERVICES: {', '.join(notify_rows) if notify_rows else '(none)'}
+
+PREVIOUSLY DECLINED (do not re-propose these):
+{chr(10).join(f"- {line}" for line in declined_lines) if declined_lines else "(none)"}
+
+USER FEEDBACK COUNTS (recent): {json.dumps(sentiment, default=str)}
+
+Decide now whether anything here is genuinely worth acting on, and answer with the JSON object described in your instructions only."""
+    return _REFLECTION_SYSTEM_PROMPT, user_prompt
+
+
+def _parse_reflection_json(raw: Any) -> List[Dict[str, Any]]:
+    """Extract the proposals list from the LLM reply (fenced or bare JSON). A
+    malformed response yields [] — discarded and logged, like an announce failure."""
+    text = _text(raw)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return []
+    try:
+        data = json.loads(text[start:end + 1])
+    except Exception:
+        return []
+    proposals = data.get("suggestions") if isinstance(data, dict) else None
+    if not isinstance(proposals, list):
+        return []
+    return [row for row in proposals if isinstance(row, dict)]
+
+
+def _generate_reflection_proposals(rc: Any = None) -> List[Dict[str, Any]]:
+    """ONE chat call to the primary Hydra base LLM (same client/timeout pattern as
+    the message_style generator). Returns validated proposal dicts ([] when the
+    model is unavailable or the reply is malformed)."""
+    if _shared_get_primary_llm_client is None:
+        raise RuntimeError("the Tater base LLM client is unavailable in this runtime")
+    rc = rc if rc is not None else _redis()
+    system_prompt, user_prompt = _build_reflection_prompt(rc)
+    timeout = _REFLECTION_TIMEOUT_SECONDS
+
+    def _run() -> str:
+        async def _chat() -> str:
+            async with _shared_get_primary_llm_client(redis_conn=rc) as llm:
+                result = await llm.chat(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    timeout=timeout,
+                    max_tokens=1200,
+                    temperature=0.4,
+                )
+            if not isinstance(result, dict):
+                return ""
+            message = result.get("message") if isinstance(result.get("message"), dict) else {}
+            return _text(message.get("content"))
+
+        return asyncio.run(_chat())
+
+    future = _RUNNER_EXECUTOR.submit(_run)
+    raw = future.result(timeout=timeout + 15.0)
+    proposals = _parse_reflection_json(raw)
+    if raw and not proposals:
+        logger.info("[automation_ga] reflection reply malformed — discarded (%d chars)", len(raw))
+    return proposals
+
+
+def _reflect_once(rc: Any, now: Optional[float] = None) -> Dict[str, Any]:
+    """Step 2 of the pass (§15.6.1): build context, one LLM call, validate and
+    store the batch (delivery handled by _store_new_suggestions)."""
+    now = now if now is not None else time.time()
+    try:
+        proposals = _generate_reflection_proposals(rc)
+        llm_error = ""
+    except Exception as exc:
+        proposals, llm_error = [], f"{type(exc).__name__}: {exc}"
+        logger.warning("[automation_ga] reflection LLM call failed: %s", llm_error)
+    stored = _store_new_suggestions(rc, proposals) if proposals else []
+    summary = {
+        "proposals": len(proposals),
+        "stored": len(stored),
+        "llm_error": llm_error,
+    }
+    _log_activity(rc, "", "reflection", "reflection pass",
+                  f"{len(stored)} suggestion(s) stored of {len(proposals)} proposed"
+                  + (f" — {llm_error}" if llm_error else ""))
+    return summary
+
+
+def _next_reflection_interval(rc: Any) -> int:
+    """Step 3 (§15.6.1): pure adaptive cadence — back off geometrically after a
+    no-yield pass, recover to the base interval after an approval. The streak
+    counts consecutive no-yield passes."""
+    base = max(60.0, _as_float(_setting(rc, "reflection_interval_seconds", 21600.0), 21600.0))
+    ceiling = max(base, _as_float(_setting(rc, "reflection_interval_max_seconds", 86400.0), 86400.0))
+    state = _reflection_state(rc)
+    if state.get("yielded"):
+        interval, streak = base, 0
+    else:
+        previous = max(base, _as_float(state.get("interval_seconds"), base))
+        interval = min(ceiling, previous * 2.0)
+        streak = _as_int(state.get("streak"), 0) + 1
+    state["interval_seconds"] = interval
+    state["streak"] = streak
+    state["yielded"] = False
+    state["declined_since_pass"] = 0
+    _save_reflection_state(rc, state)
+    return int(interval)
+
+
+def _reflection_pass(rc: Any, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """One scheduler iteration: gate → propose → reschedule. Returns the pass
+    summary when it ran, None when the gate skipped (reason in reflection_state)."""
+    now = now if now is not None else time.time()
+    due, reason = _reflection_due(rc, now)
+    state = _reflection_state(rc)
+    state["last_gate_ts"] = round(now, 3)
+    state["last_skip"] = "" if due else reason
+    _save_reflection_state(rc, state)
+    if not due:
+        return None
+    result = _reflect_once(rc, now)
+    state = _reflection_state(rc)  # reload: the pass may have written notify counts
+    # stamp "seen up to" from AFTER the pass, at full (unrounded) precision:
+    # everything the pass itself logged (reflection + stored-suggestion rows)
+    # counts as seen, so the next gate's delta check only fires on genuinely
+    # new activity — rounding to milliseconds would overshoot rows logged in
+    # the same millisecond
+    state["last_pass_ts"] = time.time()
+    state["last_pass"] = result
+    _save_reflection_state(rc, state)
+    _next_reflection_interval(rc)
+    return result
+
+
+def _reflection_loop(redis_client: Any = None, stop_event: Optional[Any] = None) -> None:
+    """The run() child thread: sleep between passes, never more than an hour at a
+    time so setting changes are picked up. Disabled entirely when
+    reflection_interval_seconds is 0."""
+    rc = redis_client if redis_client is not None else _redis()
+    stop_event = stop_event if stop_event is not None else threading.Event()
+    while not stop_event.is_set():
+        base = _as_float(_setting(rc, "reflection_interval_seconds", 21600.0), 21600.0)
+        if base <= 0:
+            return
+        state = _reflection_state(rc)
+        interval = max(base, _as_float(state.get("interval_seconds"), base))
+        if stop_event.wait(min(max(interval, 60.0), 3600.0)):
+            return
+        try:
+            _reflection_pass(rc)
+        except Exception:
+            logger.exception("reflection pass failed")
+
+
+# ---------------------------------------------------------------------------
 # entity journal (§15.5 — Phase 2, v1.3.0)
 # ---------------------------------------------------------------------------
 
@@ -4171,6 +5182,14 @@ def _activity_digest(rc: Any) -> Dict[str, Any]:
 def _tick(client: Any) -> None:
     rc = client if client is not None else _redis()
     _process_pending(rc)
+    # suggestions housekeeping (§15.6.3/§15.6.6): expire old rows, then deliver
+    # whatever is now due (presence flushes / window-batch flush) — cheap no-ops
+    # when the suggestion queue is empty
+    try:
+        _expire_suggestions(rc)
+        _flush_suggestion_delivery(rc)
+    except Exception:
+        logger.exception("suggestion delivery pass failed")
     automations = _load_automations(rc)
     # entity journal (§15.5): runs before the automations early-return so
     # journal_scope="all" keeps observing even with zero automations
@@ -4248,6 +5267,13 @@ def run(stop_event=None) -> None:
             logger.info("automation ga core seeded %d builtin automations (disabled)", len(seeded))
     except Exception:
         logger.exception("builtin seeding failed")
+    # reflection thread (§15.6.1): a daemon sibling of the tick thread, stopped by
+    # the same stop_event — the host joins only run() itself (timeout 3s), so
+    # both inner threads must exit promptly via stop_event
+    reflection_thread = threading.Thread(
+        target=_reflection_loop, kwargs={"redis_client": rc, "stop_event": stop_event},
+        daemon=True, name=f"{MODULE_KEY}-reflection")
+    reflection_thread.start()
     while not stop_event.is_set():
         poll = _poll_seconds(rc)
         try:
@@ -4255,6 +5281,7 @@ def run(stop_event=None) -> None:
         except Exception:
             logger.exception("automation tick failed")
         if own_event:
+            reflection_thread.join(timeout=0.1)
             break
         deadline = time.time() + poll
         while not stop_event.is_set() and time.time() < deadline:
@@ -4424,6 +5451,21 @@ def get_hydra_kernel_tools(platform: str = "", redis_client: Any = None, core_ke
             "id": "automation_activity",
             "description": "Recent activity log entries (triggered/runs/answers/errors), optionally filtered by automation id.",
             "usage": '{"function":"automation_activity","arguments":{"limit":20}}',
+        },
+        {
+            "id": "automation_suggest_list",
+            "description": "The Generative Agent's suggestion queue for review: proposed automations/changes awaiting approval or decline. Use this before proposing edits yourself so the user sees one review surface. status is pending (default), approved, declined, expired, or all.",
+            "usage": '{"function":"automation_suggest_list","arguments":{"status":"pending"}}',
+        },
+        {
+            "id": "automation_approve",
+            "description": "Approve one pending suggestion from automation_suggest_list: its definition is re-validated and saved through the normal automation_create/automation_update path.",
+            "usage": '{"function":"automation_approve","arguments":{"id":"s_1234abcd"}}',
+        },
+        {
+            "id": "automation_decline",
+            "description": "Decline one pending suggestion: recorded so reflection avoids re-proposing it.",
+            "usage": '{"function":"automation_decline","arguments":{"id":"s_1234abcd"}}',
         },
     ]
     return rows
@@ -4643,6 +5685,45 @@ def run_hydra_kernel_tool(
         rows = _read_activity(rc, _text(args.get("id")), limit)
         facts = [f"{len(rows)} activity entries"] if rows else ["No activity yet"]
         return {"ok": True, "facts": facts, "data": {"activity": rows}, "say_hint": "Summarize the recent activity."}
+
+    if tool == "automation_suggest_list":
+        wanted = _token(args.get("status")) or "pending"
+        rows = []
+        for suggestion_id, row in sorted(_load_suggestions(rc).items(), key=lambda pair: _as_float(pair[1].get("ts"), 0.0)):
+            if wanted != "all" and row.get("status") != wanted:
+                continue
+            definition = row.get("definition") if isinstance(row.get("definition"), dict) else {}
+            rows.append({
+                "id": suggestion_id,
+                "kind": _text(row.get("kind")),
+                "target_id": _text(row.get("target_id")),
+                "name": _text(definition.get("name")),
+                "rationale": _text(row.get("rationale")),
+                "confidence": _text(row.get("confidence")),
+                "trigger": _trigger_label(definition.get("trigger")),
+                "action": _action_label(definition.get("actions")),
+                "ts_text": _text(row.get("ts_text")),
+            })
+        facts = [f"{len(rows)} {wanted} suggestion(s)" if rows else f"No {wanted} suggestions"]
+        return {"ok": True, "facts": facts, "data": {"suggestions": rows}, "say_hint": "Review with the user; approve with automation_approve or decline with automation_decline by id."}
+
+    if tool == "automation_approve":
+        result = _approve_suggestion(rc, _text(args.get("id")))
+        return {
+            "ok": bool(result.get("ok")),
+            "facts": [result.get("message", "Done")] if result.get("ok") else [],
+            "error": None if result.get("ok") else {"code": "approve_failed", "message": _text(result.get("message"))},
+            "say_hint": "Tell the user the automation is saved and what it does." if result.get("ok") else _text(result.get("message")),
+        }
+
+    if tool == "automation_decline":
+        result = _decline_suggestion(rc, _text(args.get("id")))
+        return {
+            "ok": bool(result.get("ok")),
+            "facts": [result.get("message", "Done")] if result.get("ok") else [],
+            "error": None if result.get("ok") else {"code": "decline_failed", "message": _text(result.get("message"))},
+            "say_hint": "Confirm the decline" if result.get("ok") else _text(result.get("message")),
+        }
 
     return None
 
@@ -6650,6 +7731,33 @@ def get_htmlui_tab_data(redis_client: Any = None, core_key: str = "", core_tab: 
                 "detail": _text(row.get("detail")),
             }
         )
+    person_rows = _load_persons(rc)
+    item_forms.append(_add_person_card(rc))
+    for person_id, person_row in person_rows.items():
+        item_forms.append(_person_card(person_id, person_row, rc))
+    suggestion_rows = _load_suggestions(rc)
+    pending_suggestions = [
+        (sid, srow)
+        for sid, srow in suggestion_rows.items()
+        if _text(srow.get("status")) == "pending"
+    ]
+    for sid, srow in sorted(pending_suggestions, key=lambda pair: _as_float(pair[1].get("ts"), 0.0), reverse=True):
+        item_forms.append(_suggestion_card(sid, srow))
+    resolved_suggestions = [
+        (sid, srow)
+        for sid, srow in suggestion_rows.items()
+        if _text(srow.get("status")) != "pending"
+    ]
+    for sid, srow in sorted(resolved_suggestions, key=lambda pair: _as_float(pair[1].get("ts"), 0.0), reverse=True)[:8]:
+        item_forms.append(
+            {
+                "id": f"sug_{sid}",
+                "group": "suggestions",
+                "title": f"{_text(srow.get('status')).title()} — {(_text((srow.get('definition') or {}).get('name')) or sid)}",
+                "subtitle": _text(srow.get("ts_text")),
+                "detail": _text(srow.get("rationale")),
+            }
+        )
     manager_tabs = [
         {
             "key": "automations",
@@ -6669,6 +7777,28 @@ def get_htmlui_tab_data(redis_client: Any = None, core_key: str = "", core_tab: 
             "empty_message": "No activity yet.",
         },
     ]
+    tab_keys = [tab["key"] for tab in manager_tabs]
+    for new_tab in (
+        {
+            "key": "suggestions",
+            "label": "Suggestions",
+            "source": "items",
+            "item_group": "suggestions",
+            "selector": False,
+            "empty_message": "No suggestions pending — the agent proposes automations here for your approval.",
+        },
+        {
+            "key": "persons",
+            "label": "Persons",
+            "source": "items",
+            "item_group": "persons",
+            "selector": False,
+            "empty_message": "No persons in the catalog — add one to name presence rows and camera conditions.",
+        },
+    ):
+        if new_tab["key"] not in tab_keys:
+            manager_tabs.append(new_tab)
+    manager_tabs.sort(key=lambda t: {"automations": 0, "suggestions": 1, "persons": 2, "create": 3, "activity": 4}.get(t["key"], 9))
     if return_to_automations:
         manager_tabs = [tab for tab in manager_tabs if tab["key"] != "create"]
     return {
@@ -6678,6 +7808,8 @@ def get_htmlui_tab_data(redis_client: Any = None, core_key: str = "", core_tab: 
             {"label": "Total", "value": len(automations)},
             {"label": "Runs (24h)", "value": runs_24h},
             {"label": "Pending answers", "value": len(pending)},
+            {"label": "Suggestions", "value": len(pending_suggestions)},
+            {"label": "Persons", "value": len(_load_persons(rc))},
         ],
         "items": [],
         "empty_message": "No automations yet — ask Tater in any chat: 'Build me an automation that…'",
@@ -6758,6 +7890,50 @@ def handle_htmlui_tab_action(
         rc.hset(AUTOMATIONS_KEY, auto_id, json.dumps(definition, separators=(",", ":"), default=str))
         _log_activity(rc, auto_id, _text(definition.get("name")), "updated", "form editor")
         return {"ok": True, "id": auto_id, "message": f"Automation '{_text(definition.get('name'))}' saved."}
+    if action == "ga_person_save":
+        existing_persons = _load_persons(rc)
+        person_id = _text(payload.get("id"))
+        person_name = _text(values.get("person_name"))
+        if not person_name:
+            return {"ok": False, "message": "A person needs a name."}
+        if person_id in ("", "add_person"):
+            match = next((pid for pid, row in existing_persons.items()
+                          if _text(row.get("name")).lower() == person_name.lower()), "")
+            if match:
+                return {"ok": False, "message": f"A person named '{person_name}' already exists — edit them instead."}
+            person_id = f"p_{uuid.uuid4().hex[:8]}"
+            change = "added"
+        else:
+            if person_id not in existing_persons:
+                return {"ok": False, "message": f"Person '{person_id}' not found — reload the tab."}
+            change = "updated"
+        person_row = {
+            "name": person_name,
+            "trackers": [_text(t) for t in _list(values.get("person_trackers")) if _text(t)],
+            "face_name": _text(values.get("person_face_name")),
+            "targets": _text(values.get("person_targets")),
+        }
+        try:
+            rc.hset(PERSONS_KEY, person_id, json.dumps(person_row, separators=(",", ":"), default=str))
+        except Exception as exc:
+            return {"ok": False, "message": f"Person save failed: {exc}"}
+        return {"ok": True, "id": person_id, "message": f"Person '{person_name}' {change}."}
+    if action == "ga_person_delete":
+        person_id = _text(payload.get("id"))
+        person_row = _load_persons(rc).get(person_id)
+        if not person_row:
+            return {"ok": False, "message": f"Person '{person_id}' not found."}
+        person_name = _text(person_row.get("name")) or person_id
+        rc.hdel(PERSONS_KEY, person_id)
+        return {"ok": True, "message": f"Person '{person_name}' deleted."}
+    if action == "ga_suggestion_approve":
+        result = _approve_suggestion(rc, _text(payload.get("id")))
+        message = _text(result.get("message")) or "; ".join(result.get("facts") or [])
+        return {"ok": bool(result.get("ok")), "message": message or "Done."}
+    if action == "ga_suggestion_decline":
+        result = _decline_suggestion(rc, _text(payload.get("id")))
+        message = _text(result.get("message")) or "; ".join(result.get("facts") or [])
+        return {"ok": bool(result.get("ok")), "message": message or "Done."}
     if action in ("tab_toggle", "tab_run", "tab_delete", "tab_undamp") and auto_id not in automations:
         return {"ok": False, "message": f"Automation '{auto_id}' not found."}
     if action == "ga_restore_builtin":

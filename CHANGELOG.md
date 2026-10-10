@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.4.0 — 2026-10-10 (minor — Phase 3 of the proactive-agent design, `specs/proactive_agent_design.md`)
+
+- **Features**
+  - New **reflection pass** (`specs/proactive_agent_design.md` §15.6): a
+    daemon reflection thread alongside the runner tick runs a deliberately
+    three-step loop — a plain-code skip-gate (`_reflection_due`: interval
+    elapsed, something happened since the last pass, queue under cap,
+    notification budget unspent, nothing deliverable → first failing clause
+    written to state so quietness is always explainable), **one** base-LLM
+    chat call (`_reflect_once`, 90 s cap, malformed JSON replies discarded)
+    built on the entity-journal/activity digest plus existing automations,
+    the declined list and feedback counts, and a pure adaptive cadence
+    (`_next_reflection_interval`: the interval doubles after no-yield passes
+    and returns to the base after an approval — the agent feels quiet, not
+    sulky). `reflection_interval_seconds: 0` disables it; the default is 6h.
+  - New **human-approved suggestion queue**: validated suggestions are stored
+    (`automation_ga_core:suggestions`) with a queue cap
+    (`max_pending_suggestions`, oldest drops), a TTL
+    (`suggestion_ttl_hours`, default 1 week), a declined-list feedback log
+    that feeds the next reflection prompt ("do not re-propose"), a daily
+    notification budget (`suggestion_notify_daily_cap` — the G8 unsolicited-
+    contact cap; delivery flushes are always exempt), and an optional daily
+    delivery window. New chat kernel tools `automation_suggest_list`
+    (status filter incl. `all`), `automation_approve` and `automation_decline`.
+    **Approval is the only path to a saved automation**: suggestions are
+    re-validated at approval time and saved through the normal
+    `automation_create`/`automation_update` kernel tool paths.
+  - **Presence-aware delivery** (opt-in, off by default): a
+    `suggestion_presence_delivery` settings JSON list of per-person rows
+    (`person`, BLE `tracker` or `camera` with `any_person`/`named` mode via
+    the same `_camera_person_check` helper as the `camera_face` condition)
+    turns new batches into personalized per-person copies, delivered by the
+    tick-side flush when that person's tracker reads home or the camera
+    check passes (re-checks throttled by
+    `suggestion_presence_check_seconds`; copies deferred longer than
+    `suggestion_max_defer_hours` flush anyway).
+  - New **Persons** manager tab and catalog: gives "person" a home for
+    presence rows and named camera conditions (BLE tracker multiselect fed
+    by the presence engine, Face ID name, default notify target; saved
+    values pinned "(saved)"). Unknown free-text persons in conditions get a
+    validation warning, never a block.
+  - New **Suggestions** manager tab: pending cards with Approve/Decline
+    buttons and a full definition popup, recent history cards underneath.
+    Kernel-tool descriptions and the WebUI stats now include the queue.
+  - New settings: `reflection_interval_seconds`,
+    `reflection_interval_max_seconds`, `max_pending_suggestions`,
+    `suggestion_ttl_hours`, `suggestion_notify_daily_cap`,
+    `suggestion_max_defer_hours`, `suggestion_presence_check_seconds`,
+    `suggestion_presence_delivery`, `suggestion_window_enabled/_after/_before`.
+- No breaking changes: no definition-schema change; reflection and presence
+  delivery are opt-in or silent by defaults; the uninstall "delete core
+  data" cleanup covers the four new keys (persons, suggestions, feedback,
+  reflection_state).
+- Tests (offline): smoke 204 → 293 checks (suggestion queue cap/TTL/approve/
+  decline round-trips, delivery + window/budget flushes, presence copies +
+  throttle + defer, skip-gate clauses, JSON parsing, adaptive cadence);
+  live-checklist mirror 69 → 93 checks (B14 end-to-end suggestion flow
+  through the real `_tick`, B15 reflection pass); both pass offline.
+
 ## 1.3.0 — 2026-10-10 (minor — Phase 2 of the proactive-agent design, `specs/proactive_agent_design.md`)
 
 - **Features**
