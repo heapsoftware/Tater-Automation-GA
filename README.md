@@ -5,7 +5,7 @@ built on the HGA "Sentinel" principle: **the LLM authors the automation
 rules, a deterministic runner executes them**. The runner never
 improvises — it only performs what a validated definition says.
 
-Version **1.2.0** · Runs on every Tater platform (webui, discord,
+Version **1.3.0** · Runs on every Tater platform (webui, discord,
 voice_core, portals, Little Spud)
 
 ## What it does

@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.3.0 — 2026-10-10 (minor — Phase 2 of the proactive-agent design, `specs/proactive_agent_design.md`)
+
+- **Features**
+  - New **entity journal**: every runner tick diffs the watched entities'
+    states against the previous tick and appends change rows to a ring buffer
+    (`automation_ga_core:journal`, newest first, capped by the new
+    `max_journal_rows` setting, default 2000). Each row carries
+    `{ts, ts_text, entity, from, to, held_seconds}` — `held_seconds` is how
+    long the previous state had held, so the journal doubles as a retention
+    of the arming tracker's knowledge ("how long has the garage door been
+    open?"). The first sighting of an entity seeds the cursor silently, like
+    edge-trigger arming; a change never costs an LLM call.
+    Scope defaults to `watched` (entities referenced by enabled automations
+    and builtins); `journal_scope: "all"` observes the whole HA state cache
+    capped alphabetically by `journal_max_entities` (default 150) and keeps
+    running even when no automations exist.
+  - `automation_capabilities` now also returns a **recent-activity digest**
+    (`data.recent`): the last 30 journal rows, currently
+    `unavailable`/`unknown` entities, per-camera UniFi Protect person-event
+    counts over the last 24h, and per-automation outcome stats
+    (`run_count`/`last_answer`/`unanswered_count`/`enabled`). This is the
+    shared context the upcoming reflection pass will reuse, and it lets chat
+    authoring answer "what has the garage door been doing?" from real data.
+  - New settings: `journal_scope`, `journal_max_entities`, `max_journal_rows`
+    (declared in the settings UI with defaults; all optional).
+- No breaking changes: no definition-schema change, existing automations
+  unaffected; the uninstall "delete core data" cleanup covers the two new
+  journal keys.
+- Tests (offline): smoke 190 → 204 checks (journal diff/cursor/holding-time/
+  trim, scope cap, digest shape + capabilities digest); live-checklist mirror
+  62 → 69 checks (journal across the real `_tick` loop, scope cap, zero-
+  automation journaling); both pass offline.
+
 ## 1.2.0 — 2026-10-10 (minor — Phase 1 of the proactive-agent design, `specs/proactive_agent_design.md`)
 
 First slice of the proactive-agent roadmap: the LLM-authored rules are now

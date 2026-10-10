@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -156,6 +156,8 @@ INTEGRATION_STATES_KEY = "tater:integration_runtime:states"
 INTEGRATION_EVENTS_KEY = "tater:integration_runtime:events"
 ENTITY_STATES_KEY = f"{MODULE_KEY}:entity_states"
 UI_STATE_KEY = f"{MODULE_KEY}:ui_state"
+JOURNAL_KEY = f"{MODULE_KEY}:journal"
+JOURNAL_META_KEY = f"{MODULE_KEY}:journal_meta"
 
 LEAF_ACTION_TYPES = ("call_service", "announce", "notify", "wait", "webhook")
 ALL_ACTION_TYPES = ("ask_yes_no", "camera_ai", "device", *LEAF_ACTION_TYPES)
@@ -396,6 +398,24 @@ CORE_SETTINGS = {
             "type": "number",
             "default": 86400,
             "description": "Upper bound the damping can widen an automation's cooldown to; toggling or answering resets it.",
+        },
+        "journal_scope": {
+            "label": "Entity journal scope",
+            "type": "text",
+            "default": "watched",
+            "description": "Which entities the activity journal tracks: 'watched' (entities referenced by automations and builtins) or 'all' (every cached HA entity, capped by journal_max_entities).",
+        },
+        "journal_max_entities": {
+            "label": "Entity journal max entities",
+            "type": "number",
+            "default": 150,
+            "description": "Cap on journaled entities when journal_scope is 'all' (first N alphabetically).",
+        },
+        "max_journal_rows": {
+            "label": "Journal rows kept",
+            "type": "number",
+            "default": 2000,
+            "description": "Ring-buffer size of the entity-state-change journal.",
         },
     },
 }
@@ -4016,10 +4036,145 @@ def _trigger_due(
 # main runner loop
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# entity journal (§15.5 — Phase 2, v1.3.0)
+# ---------------------------------------------------------------------------
+
+def _journal_scope_entities(rc: Any, automations: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Entities the journal diffs each tick: the automation-referenced entities
+    (builtins' watch_entities included) by default, or the whole state cache
+    capped alphabetically when journal_scope="all"."""
+    if _token(_setting(rc, "journal_scope", "watched")) == "all":
+        cap = max(1, _as_int(_setting(rc, "journal_max_entities", 150), 150))
+        return sorted(_ha_entities(rc))[:cap]
+    watched = _automation_entities(automations)
+    return sorted(dict.fromkeys(watched))
+
+
+def _journal_tick(rc: Any, automations: Dict[str, Dict[str, Any]]) -> int:
+    """Diff the watched entities' states against the previous tick's journal
+    cursor and append change rows (newest-first). First sighting of an entity
+    seeds the cursor silently, like edge-trigger arming — no row on baseline.
+
+    Returns the number of change rows appended. Failures never break the tick.
+    """
+    try:
+        entities = _journal_scope_entities(rc, automations)
+        if not entities:
+            return 0
+        cursor = rc.hgetall(JOURNAL_META_KEY) or {}
+        states = _ha_entities(rc)
+        now = time.time()
+        rows: List[Dict[str, Any]] = []
+        cursor_updates: List[Tuple[str, str]] = []
+        for entity_id in entities:
+            current = _text(states.get(entity_id, {}).get("state"))
+            if not current:
+                continue
+            prev_row: Dict[str, Any] = {}
+            try:
+                prev_raw = cursor.get(entity_id)
+                if prev_raw:
+                    loaded = json.loads(prev_raw)
+                    prev_row = loaded if isinstance(loaded, dict) else {}
+            except Exception:
+                prev_row = {}
+            last_state = _text(prev_row.get("last_state"))
+            last_change = _as_float(prev_row.get("last_change_ts"), 0.0)
+            if not last_state or last_change <= 0.0:
+                cursor_updates.append((entity_id, json.dumps({"last_state": current, "last_change_ts": now}, separators=(",", ":"))))
+                continue
+            if last_state == current:
+                continue
+            rows.append({
+                "ts": round(now, 3),
+                "ts_text": _now_iso(),
+                "entity": entity_id,
+                "from": last_state,
+                "to": current,
+                "held_seconds": round(max(0.0, now - last_change), 1),
+            })
+            cursor_updates.append((entity_id, json.dumps({"last_state": current, "last_change_ts": now}, separators=(",", ":"))))
+        if cursor_updates:
+            for entity_id, blob in cursor_updates:
+                rc.hset(JOURNAL_META_KEY, entity_id, blob)
+        if rows:
+            max_rows = max(1, _as_int(_setting(rc, "max_journal_rows", 2000), 2000))
+            for row in rows:
+                rc.lpush(JOURNAL_KEY, json.dumps(row, separators=(",", ":"), default=str))
+            if rc.llen(JOURNAL_KEY) > max_rows:
+                rc.ltrim(JOURNAL_KEY, 0, max_rows - 1)
+        return len(rows)
+    except Exception:
+        logger.exception("entity journal update failed")
+        return 0
+
+
+def _activity_digest(rc: Any) -> Dict[str, Any]:
+    """The capped observe-side context shared by automation_capabilities and the
+    v1.4 reflection pass: what changed recently, what is down, and how the
+    automations have been answered."""
+    digest: Dict[str, Any] = {}
+    try:
+        journal_rows = rc.lrange(JOURNAL_KEY, 0, 29)
+        digest["recent_changes"] = [
+            json.loads(raw) if isinstance(raw, str) else dict(raw) for raw in journal_rows
+        ]
+    except Exception:
+        digest["recent_changes"] = []
+    try:
+        states = _ha_entities(rc)
+        digest["unavailable_entities"] = sorted(
+            entity_id for entity_id, row in states.items()
+            if _text(row.get("state")) in ("unavailable", "unknown")
+        )
+    except Exception:
+        digest["unavailable_entities"] = []
+    try:
+        cutoff = time.time() - 86400.0
+        counts: Dict[str, int] = {}
+        for row in _recent_events(rc, limit=600):
+            if _text(row.get("provider")) != "unifi_protect":
+                continue
+            if _as_float(row.get("ts"), 0.0) < cutoff:
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            event_type = _text(
+                payload.get("type") or payload.get("eventType") or payload.get("event_type")
+            ).lower()
+            if "person" not in event_type:
+                continue
+            counts[_text(row.get("camera")) or _text(payload.get("camera")) or "unknown"] = counts.get(
+                _text(row.get("camera")) or _text(payload.get("camera")) or "unknown", 0
+            ) + 1
+        digest["protect_person_events_24h"] = counts
+    except Exception:
+        digest["protect_person_events_24h"] = {}
+    try:
+        metas = _load_meta(rc)
+        automations = _load_automations(rc)
+        stats: Dict[str, Dict[str, Any]] = {}
+        for auto_id, definition in automations.items():
+            meta = metas.get(auto_id) if isinstance(metas.get(auto_id), dict) else {}
+            stats[_text(definition.get("name")) or auto_id] = {
+                "run_count": _as_int((meta or {}).get("run_count"), 0),
+                "last_answer": _text((meta or {}).get("last_answer")),
+                "unanswered_count": _as_int((meta or {}).get("unanswered_count"), 0),
+                "enabled": _automation_enabled(definition),
+            }
+        digest["automation_stats"] = stats
+    except Exception:
+        digest["automation_stats"] = {}
+    return digest
+
+
 def _tick(client: Any) -> None:
     rc = client if client is not None else _redis()
     _process_pending(rc)
     automations = _load_automations(rc)
+    # entity journal (§15.5): runs before the automations early-return so
+    # journal_scope="all" keeps observing even with zero automations
+    _journal_tick(rc, automations)
     if not automations:
         return
     metas = _load_meta(rc)
@@ -4217,7 +4372,7 @@ def get_hydra_kernel_tools(platform: str = "", redis_client: Any = None, core_ke
     rows = [
         {
             "id": "automation_capabilities",
-            "description": "Returns the automation definition schema, rules, the current list of Home Assistant entity ids with states, and camera-capable devices. Call this before creating or editing automations.",
+            "description": "Returns the automation definition schema, rules, the current list of Home Assistant entity ids with states, camera-capable devices, and a digest of recent activity (entities that changed state recently, currently unavailable entities, camera person-event counts, automation outcome stats). Call this before creating or editing automations.",
             "usage": '{"function":"automation_capabilities","arguments":{"include_entities":true}}',
         },
         {
@@ -4291,9 +4446,10 @@ def run_hydra_kernel_tool(
     if tool == "automation_capabilities":
         include_entities = bool(args.get("include_entities", True))
         doc = _capabilities_document(rc, include_entities=include_entities)
+        recent = _activity_digest(rc)
         if include_entities:
-            return {"ok": True, "facts": ["Automation definition schema returned"], "data": {"schema": doc}, "say_hint": "Use the schema to build the automation definition."}
-        return {"ok": True, "facts": ["Automation definition schema returned; entity listing skipped — call with include_entities true for it."], "data": {"schema": doc}, "say_hint": "Use the schema to build the automation definition."}
+            return {"ok": True, "facts": ["Automation definition schema and recent-activity digest returned"], "data": {"schema": doc, "recent": recent}, "say_hint": "Use the schema to build the automation definition."}
+        return {"ok": True, "facts": ["Automation definition schema and recent-activity digest returned; entity listing skipped — call with include_entities true for it."], "data": {"schema": doc, "recent": recent}, "say_hint": "Use the schema to build the automation definition."}
 
     if tool == "automation_entity_states":
         requested = [_text(args.get("entity"))] if _text(args.get("entity")) else []
