@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -157,10 +157,10 @@ INTEGRATION_EVENTS_KEY = "tater:integration_runtime:events"
 ENTITY_STATES_KEY = f"{MODULE_KEY}:entity_states"
 UI_STATE_KEY = f"{MODULE_KEY}:ui_state"
 
-LEAF_ACTION_TYPES = ("call_service", "announce", "notify", "wait")
+LEAF_ACTION_TYPES = ("call_service", "announce", "notify", "wait", "webhook")
 ALL_ACTION_TYPES = ("ask_yes_no", "camera_ai", "device", *LEAF_ACTION_TYPES)
 TRIGGER_TYPES = ("interval", "entity_state", "time", "protect_event")
-CONDITION_TYPES = ("entity_state", "camera_people", "camera_vision", "presence", "time_window")
+CONDITION_TYPES = ("entity_state", "camera_people", "camera_vision", "camera_face", "presence", "time_window")
 ENTITY_MATCH_OPS = ("equals", "not_equals", "contains", "above", "below")
 NOTIFY_PRIORITIES = ("low", "normal", "high", "urgent")
 
@@ -384,6 +384,18 @@ CORE_SETTINGS = {
             "type": "number",
             "default": 300,
             "description": "How many recent activity entries to retain.",
+        },
+        "damping_unanswered_threshold": {
+            "label": "Damping threshold (unanswered prompts)",
+            "type": "number",
+            "default": 3,
+            "description": "Every Nth unanswered ask_yes_no window widens the automation's cooldown (nuisance damping); answering resets the count.",
+        },
+        "damping_cooldown_max_seconds": {
+            "label": "Damping cooldown cap (seconds)",
+            "type": "number",
+            "default": 86400,
+            "description": "Upper bound the damping can widen an automation's cooldown to; toggling or answering resets it.",
         },
     },
 }
@@ -1335,6 +1347,37 @@ def _entity_state_match(client: Any, spec: Dict[str, Any]) -> Tuple[bool, str]:
     return ok, f"{entity_id} is '{current}'" + ("" if ok else f" not '{wanted}'")
 
 
+def _ha_notify_services(rc: Any) -> List[str]:
+    """HA notify.* service names (companion-app `notify.mobile_app_*` entries among
+    them) for the authoring capabilities document. Read-only GET /api/services
+    through the same REST channel `_ha_call_service` already uses; [] on any failure
+    so a broken/unconfigured HA never breaks authoring."""
+    if requests is None:
+        return []
+    base, token = _ha_rest_config(rc)
+    if not base or not token:
+        return []
+    try:
+        resp = requests.get(
+            f"{base.rstrip('/')}/api/services",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if resp.status_code >= 400:
+            return []
+        rows = resp.json() or []
+    except Exception:
+        return []
+    out: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or _text(row.get("domain")) != "notify":
+            continue
+        for service in row.get("services") or []:
+            if isinstance(service, dict) and _text(service.get("service")):
+                out.append(f"notify.{_text(service['service'])}")
+    return sorted(dict.fromkeys(out))
+
+
 def _ha_call_service(client: Any, domain: str, service: str, data: Dict[str, Any]) -> Tuple[bool, str]:
     rc = client if client is not None else _redis()
     domain = _text(domain)
@@ -1646,7 +1689,8 @@ def _state_catalog_transitions(rc: Any, entity_id: str, limit: int = 6) -> List[
 
 
 def _automation_entities(automations: Dict[str, Dict[str, Any]]) -> List[str]:
-    """HA entity ids referenced by automation triggers/conditions."""
+    """HA entity ids referenced by automation triggers/conditions (plus builtin
+    watch_entities scans)."""
     out: List[str] = []
     for definition in automations.values():
         if not isinstance(definition, dict) or not _automation_enabled(definition):
@@ -1659,7 +1703,187 @@ def _automation_entities(automations: Dict[str, Dict[str, Any]]) -> List[str]:
                     entity_id = _text(spec.get("entity"))
                     if entity_id and entity_id not in out:
                         out.append(entity_id)
+        watch = definition.get("watch_entities")
+        if isinstance(watch, list):
+            for watch_id in watch:
+                watched = _text(watch_id)
+                if watched and watched not in out:
+                    out.append(watched)
     return out
+
+
+# ---------------------------------------------------------------------------
+# built-in anomaly automations (seeded once, always disabled)
+# ---------------------------------------------------------------------------
+
+BUILTINS_MARKER = "automation_ga_core:builtins_seeded"
+
+
+def _builtin_definitions_for_seed(rc: Any) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """Canonical (builtin_id, name, definition) rows, with best-effort entity/camera
+    discovery from the live caches. Placeholder references that do not exist simply
+    never fire, so a failed discovery is inert-safe, never an error."""
+    entities = _ha_entities(rc)
+
+    def _find_entity(needle: str, domains: Sequence[str]) -> str:
+        for entity_id in sorted(entities):
+            domain = entity_id.split(".", 1)[0]
+            if domains and domain not in domains:
+                continue
+            if needle in entity_id.lower() or needle in _text(entities[entity_id].get("friendly_name")).lower():
+                return entity_id
+        return ""
+
+    camera_rows = _camera_device_options(_registry(rc))
+    camera_ref = _text(camera_rows[0].get("value")) if camera_rows else ""
+    stove_entity = _find_entity("stove", ("switch", "binary_sensor", "sensor")) or "switch.stove"
+    door_entity = (_find_entity("door", ("binary_sensor", "sensor")) or _find_entity("window", ("binary_sensor", "sensor"))) or "binary_sensor.door"
+    camera_display = _text(camera_rows[0].get("label")) if camera_rows else "great room"
+
+    return [
+        (
+            "stove_left_on",
+            "Stove-left-on safety check",
+            {
+                "name": "Stove-left-on safety check",
+                "builtin": True,
+                "builtin_id": "stove_left_on",
+                "enabled": False,
+                "trigger": {"type": "entity_state", "entity": stove_entity, "state": "on", "for_seconds": 900},
+                "conditions": [{"type": "camera_people", "camera": camera_ref, "lookback_seconds": 180, "expect_people": False}],
+                "actions": [
+                    {
+                        "type": "ask_yes_no",
+                        "targets": "all_satellites",
+                        "message": "The stove has been on for a while and I do not see anyone in the kitchen. Turn it off?",
+                        "timeout_seconds": 120,
+                        "yes_actions": [{"type": "call_service", "domain": "switch", "service": "turn_off", "entity_id": stove_entity}],
+                    }
+                ],
+                "mode": "single",
+                "cooldown_seconds": 1800,
+            },
+        ),
+        (
+            "door_left_open",
+            "Door-open watch",
+            {
+                "name": "Door-open watch",
+                "builtin": True,
+                "builtin_id": "door_left_open",
+                "enabled": False,
+                "trigger": {"type": "entity_state", "entity": door_entity, "state": "on", "for_seconds": 600},
+                "conditions": [{"type": "time_window", "after": "22:00", "before": "06:00"}],
+                "actions": [
+                    {
+                        "type": "notify",
+                        "platform": "webui",
+                        "title": "Door left open",
+                        "message": f"{door_entity} has been open for 10 minutes tonight.",
+                        "priority": "high",
+                    }
+                ],
+                "mode": "single",
+                "cooldown_seconds": 3600,
+            },
+        ),
+        (
+            "wellbeing_floor_check",
+            "Floor check (living room)",
+            {
+                "name": "Floor check (living room)",
+                "builtin": True,
+                "builtin_id": "wellbeing_floor_check",
+                "enabled": False,
+                "trigger": {"type": "interval", "seconds": 60},
+                "conditions": [
+                    {
+                        "type": "camera_vision",
+                        "camera": camera_ref or "great room",
+                        "prompt": "Is a person lying on the floor in an unusual or unsafe position?",
+                        "expect": True,
+                        "hold_seconds": 900,
+                        "check_seconds": 60,
+                    },
+                    {"type": "time_window", "after": "09:00", "before": "23:00"},
+                ],
+                "actions": [
+                    {
+                        "type": "ask_yes_no",
+                        "targets": "all_satellites",
+                        "message": "I have detected someone on the floor who has not been moving for some time. Are you okay?",
+                        "timeout_seconds": 120,
+                        "yes_actions": [{"type": "announce", "message": "Okay — glad you are alright.", "targets": "all_satellites"}],
+                        "no_actions": [
+                            {"type": "notify", "platform": "webui", "title": "Floor check: help declined",
+                             "message": "Someone on the floor said they are NOT okay.", "priority": "urgent"}
+                        ],
+                        "unanswered_actions": [
+                            {"type": "notify", "platform": "webui", "title": "No answer to floor check",
+                             "message": "The floor-presence alert went unanswered.", "priority": "urgent"}
+                        ],
+                    }
+                ],
+                "mode": "single",
+                "cooldown_seconds": 900,
+            },
+        ),
+        (
+            "welcome_home",
+            "Welcome home",
+            {
+                "name": "Welcome home",
+                "builtin": True,
+                "builtin_id": "welcome_home",
+                "enabled": False,
+                "trigger": {"type": "protect_event", "camera": camera_ref, "event_type": "person"},
+                "conditions": [{"type": "camera_face", "camera": camera_ref, "mode": "any_person"}],
+                "actions": [{"type": "announce", "message": "Welcome home.", "targets": "all_satellites"}],
+                "mode": "single",
+                "cooldown_seconds": 1800,
+            },
+        ),
+    ]
+
+
+def _seed_builtins(rc: Any = None) -> List[str]:
+    """Seed the builtin automations once per install (marker-gated), always disabled.
+    Every builtin must validate with the same validate_definition authors run; a
+    builtin that fails validation is re-attempted on the next start (marker stays
+    unset). Returns the ids seeded this call."""
+    rc = rc if rc is not None else _redis()
+    existing = _load_automations(rc)
+    try:
+        already = _bool(rc.get(BUILTINS_MARKER), False)
+    except Exception:
+        already = False
+    if already:
+        return []
+    seeds = _builtin_definitions_for_seed(rc)
+    seeded: List[str] = []
+    blocking_failures = 0
+    for builtin_id, name, definition in seeds:
+        auto_id = f"a_builtin_{builtin_id}"
+        if auto_id in existing:
+            continue
+        errors, _warnings = validate_definition(definition, rc)
+        if errors:
+            blocking_failures += 1
+            logger.warning("[automation_ga] builtin '%s' failed seeding validation: %s", builtin_id, "; ".join(errors))
+            continue
+        rc.hset(
+            AUTOMATIONS_KEY,
+            auto_id,
+            json.dumps(definition, separators=(",", ":"), default=str),
+        )
+        _log_activity(rc, auto_id, name, "builtin seeded (disabled)", "")
+        seeded.append(auto_id)
+    if blocking_failures == 0:
+        try:
+            rc.set(BUILTINS_MARKER, "true")
+        except Exception:
+            pass
+    return seeded
 
 
 def _ha_entity_options(
@@ -2195,6 +2419,72 @@ def _recognize_camera_faces_with_timeout(
         }
 
 
+def _camera_person_check(
+    client: Any,
+    camera_ref: Any,
+    person_wanted: str,
+    lookback_seconds: float = 60.0,
+) -> Tuple[bool, str, str]:
+    """Shared camera presence evaluation: any-person tier (Protect person events
+    within a lookback) or named tier (snapshot + Face ID identity match).
+
+    Returns (matched, detail, matched_name). Used by the camera_face condition and
+    by the v1.4.0 per-person suggestion-delivery rows — one helper, two consumers.
+    """
+    rc = client if client is not None else _redis()
+    camera = _text(camera_ref)
+    person_wanted = _text(person_wanted)
+    device = _resolve_camera_device(rc, camera)
+    if not device:
+        return False, f"camera '{camera}' not found in the integration device registry", ""
+    seen, seen_detail = _protect_people_seen(rc, camera, max(15.0, _as_float(lookback_seconds, 60.0)))
+    if not person_wanted:
+        if seen:
+            return True, f"person events on '{_text(device.get('name')) or camera}' — {seen_detail}", ""
+        return False, f"no one seen on '{_text(device.get('name')) or camera}' — {seen_detail}", ""
+    readiness = _camera_face_id_readiness(rc)
+    if readiness.get("status") != "ready":
+        # Named tier degrades to any-person when Face ID is unavailable (validated
+        # with a warning at authoring time; mirrored in tests).
+        if seen:
+            return True, f"face-id not ready ({readiness.get('warning') or 'unavailable'}); treating as any-person — {seen_detail}", ""
+        return False, f"face-id not ready ({readiness.get('warning') or 'unavailable'}); no one seen — {seen_detail}", ""
+    if run_integration_device_action is None:
+        return False, "integration device actions are unavailable in this Tater runtime", ""
+    actions = set(_device_actions(device))
+    snapshot_action = next((name for name in ("camera_snapshot", "snapshot") if name in actions), "")
+    if not snapshot_action and _camera_supports_media_mode(device, "image"):
+        snapshot_action = "camera_snapshot"
+    if not snapshot_action:
+        return False, f"camera '{_text(device.get('name')) or camera}' does not expose snapshots (face-id tier)", ""
+    try:
+        snapshot_result = run_integration_device_action(
+            _text(device.get("integration_id")),
+            snapshot_action,
+            _device_id(device),
+            {},
+        )
+        image_bytes, image_content_type = _snapshot_result_bytes(snapshot_result)
+    except Exception as exc:
+        return False, f"camera snapshot failed: {exc}", ""
+    source = {
+        "integration_id": _text(device.get("integration_id")),
+        "device_id": _device_id(device),
+        "name": _text(device.get("name")),
+    }
+    face_result = _recognize_camera_faces_with_timeout(rc, image_bytes, source=source)
+    people = [_text(name) for name in (face_result.get("people") or []) if _text(name)]
+    wanted = person_wanted.lower()
+    for name in people:
+        if wanted and wanted in name.lower():
+            label = _text(device.get("name")) or camera
+            return True, f"face-id matched '{name}' on '{label}'", name
+    if people:
+        return False, f"face-id saw {', '.join(people)} — no match for '{person_wanted}'", ""
+    extra = _text(face_result.get("warning"))
+    return False, "face-id recognized nobody" + (f" ({extra})" if extra else ""), ""
+
+
 def _camera_face_people_text(people: Sequence[Any]) -> str:
     names = [_text(value) for value in people if _text(value)]
     if len(names) <= 1:
@@ -2242,6 +2532,17 @@ def _render_template(value: Any, context: Dict[str, Any]) -> str:
     ):
         text = text.replace("{" + key + "}", _text(context.get(key)))
     return text
+
+
+def _render_template_deep(value: Any, context: Dict[str, Any]) -> Any:
+    """Render {placeholder}s in every nested string (webhook payloads); other scalars pass through."""
+    if isinstance(value, str):
+        return _render_template(value, context)
+    if isinstance(value, list):
+        return [_render_template_deep(item, context) for item in value]
+    if isinstance(value, dict):
+        return {key: _render_template_deep(item, context) for key, item in value.items()}
+    return value
 
 
 def _speech_settings() -> Dict[str, Any]:
@@ -2535,7 +2836,7 @@ def _validate_actions(
         elif action_type in ("camera_ai", "device") and not allow_ask:
             errors.append(
                 f"{label}: {action_type} may not be used inside ask_yes_no branches "
-                "(only call_service/announce/notify/wait)"
+                "(only call_service/announce/notify/webhook/wait)"
             )
             continue
         elif action_type not in ALL_ACTION_TYPES:
@@ -2608,6 +2909,24 @@ def _validate_actions(
                 errors.append(f"{label}: device requires 'provider' and 'action'")
             if not _text(action.get("device")):
                 warnings.append(f"{label}: device without 'device' targets every device on the provider that supports the action")
+        elif action_type == "webhook":
+            url = _text(action.get("url"))
+            if not url:
+                errors.append(f"{label}: webhook requires 'url'")
+            elif not url.lower().startswith(("http://", "https://")):
+                errors.append(f"{label}: webhook 'url' must start with http:// or https://")
+            elif url.lower().startswith("http://"):
+                warnings.append(f"{label}: webhook uses plain http — the payload travels unencrypted")
+            method = _text(action.get("method")).upper()
+            if method and method not in _WEBHOOK_METHODS:
+                errors.append(f"{label}: webhook 'method' must be one of {', '.join(_WEBHOOK_METHODS)}")
+            timeout = _as_float(action.get("timeout_seconds"), 10.0)
+            if "timeout_seconds" in action and not 1.0 <= timeout <= 60.0:
+                errors.append(f"{label}: webhook 'timeout_seconds' must be between 1 and 60")
+            if action.get("payload") is not None and not isinstance(action.get("payload"), dict):
+                errors.append(f"{label}: webhook 'payload' must be an object")
+            if action.get("headers") is not None and not isinstance(action.get("headers"), dict):
+                errors.append(f"{label}: webhook 'headers' must be an object")
 
 
 def validate_definition(definition: Any, client: Any = None) -> Tuple[List[str], List[str]]:
@@ -2618,6 +2937,15 @@ def validate_definition(definition: Any, client: Any = None) -> Tuple[List[str],
         return ["definition must be a JSON object"], warnings
     if not _text(definition.get("name")):
         errors.append("definition requires a 'name'")
+    watch_entities = definition.get("watch_entities")
+    if watch_entities is not None:
+        if not isinstance(watch_entities, list) or not watch_entities or not all(_text(item) for item in watch_entities):
+            errors.append("watch_entities must be a non-empty list of HA entity ids")
+        elif not _bool(definition.get("builtin")):
+            errors.append("watch_entities is reserved for builtin automations")
+        else:
+            for watched in watch_entities:
+                _check_entity_known(client, watched, warnings)
     trigger = definition.get("trigger")
     if not isinstance(trigger, dict):
         errors.append("definition requires a 'trigger' object")
@@ -2658,6 +2986,29 @@ def validate_definition(definition: Any, client: Any = None) -> Tuple[List[str],
             media_mode = _text(condition.get("media_mode"))
             if media_mode and media_mode not in _CAMERA_MEDIA_MODES:
                 errors.append(f"{label}: media_mode must be 'image' or 'video'")
+            hold = _as_float(condition.get("hold_seconds"), 0.0)
+            if "hold_seconds" in condition and not (hold == 0.0 or 3.0 <= hold <= 86400.0):
+                errors.append(f"{label}: camera_vision 'hold_seconds' must be 0 (one-shot) or between 3 and 86400")
+            check = _as_float(condition.get("check_seconds"), 0.0)
+            if "check_seconds" in condition and not (check == 0.0 or 15.0 <= check <= 3600.0):
+                errors.append(f"{label}: camera_vision 'check_seconds' must be 0 (every evaluation) or between 15 and 3600")
+            if "check_seconds" in condition and hold == 0.0:
+                warnings.append(f"{label}: camera_vision 'check_seconds' only applies with 'hold_seconds' — it is ignored for one-shot checks")
+        if condition_type == "camera_face":
+            if not _text(condition.get("camera")):
+                errors.append(f"{label}: camera_face requires 'camera'")
+            mode = _token(condition.get("mode") or "any_person")
+            if mode not in ("any_person", "named"):
+                errors.append(f"{label}: camera_face mode must be 'any_person' or 'named'")
+            elif mode == "named" and not _text(condition.get("person")):
+                errors.append(f"{label}: camera_face named mode requires 'person'")
+            lookback = _as_float(condition.get("lookback_seconds"), 0.0)
+            if "lookback_seconds" in condition and lookback < 15:
+                errors.append(f"{label}: camera_face 'lookback_seconds' must be >= 15")
+            if mode == "named" and _text(condition.get("person")) and _camera_face_id_readiness(client).get("status") != "ready":
+                warnings.append(
+                    f"{label}: camera_face named mode needs Face ID — falling back to any-person behavior at run time"
+                )
         if condition_type == "presence" and not _text(condition.get("tracker")):
             errors.append(f"{label}: presence requires 'tracker'")
         if condition_type == "time_window":
@@ -2990,7 +3341,69 @@ def _execute_device_action(client: Any, action: Dict[str, Any]) -> List[str]:
 # action execution
 # ---------------------------------------------------------------------------
 
-def _execute_actions(client: Any, automation: Dict[str, Any], actions: Any, depth: int = 0) -> List[str]:
+_WEBHOOK_METHODS = ("POST", "PUT", "PATCH", "GET")
+
+
+def _http_request(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    body: Optional[bytes] = None,
+    timeout_seconds: float = 10.0,
+) -> Tuple[bool, int, str]:
+    """One outbound HTTP call. Single transport seam: offline tests monkeypatch
+    this function instead of touching the network (build machine is offline).
+
+    Returns (transport_ok, status_code, note). Non-2xx responses raise
+    HTTPError in urllib, so they arrive as (False, code, "HTTP <code> ...")."""
+    import urllib.request
+
+    req = urllib.request.Request(url, data=body, method=method)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    try:
+        with urllib.request.urlopen(req, timeout=max(1.0, float(timeout_seconds))) as resp:
+            status = int(getattr(resp, "status", 0) or 0)
+            return (True, status, f"HTTP {status}")
+    except Exception as exc:
+        code = getattr(exc, "code", 0)
+        note = f"HTTP {code} — {exc}" if code else str(exc) or exc.__class__.__name__
+        return (False, int(code or 0), note)
+
+
+def _execute_webhook_action(
+    rc: Any,
+    automation: Dict[str, Any],
+    action: Dict[str, Any],
+    template_context: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    url = _text(action.get("url"))
+    if not url:
+        return ["FAILED webhook — no 'url' configured"]
+    method = (_text(action.get("method")) or "POST").upper()
+    if method not in _WEBHOOK_METHODS:
+        method = "POST"
+    headers = {key: _text(value) for key, value in _json_object(action.get("headers")).items() if _text(key)}
+    context = template_context if isinstance(template_context, dict) else {}
+    payload: Dict[str, Any] = _json_object(action.get("payload"))
+    body: Optional[bytes] = None
+    if payload and method != "GET":
+        rendered = {key: _render_template_deep(value, context) for key, value in payload.items()}
+        try:
+            body = json.dumps(rendered).encode("utf-8")
+        except Exception as exc:
+            return [f"FAILED webhook — payload not serializable: {exc}"]
+    timeout = min(60.0, max(1.0, _as_float(action.get("timeout_seconds"), 10.0)))
+    ok, status, note = _http_request(method, url, headers=headers or None, body=body, timeout_seconds=timeout)
+    success = bool(ok) and 200 <= status < 300
+    label = f"{method} {url[:80]}"
+    if success:
+        return [f"Webhook {label} — {note}"]
+    return [f"FAILED webhook {label} — {note}"]
+
+
+def _execute_actions(client: Any, automation: Dict[str, Any], actions: Any, depth: int = 0, template_context: Optional[Dict[str, Any]] = None) -> List[str]:
     rc = client if client is not None else _redis()
     notes: List[str] = []
     if depth > 1:
@@ -3011,6 +3424,7 @@ def _execute_actions(client: Any, automation: Dict[str, Any], actions: Any, dept
             if not message:
                 notes.append(f"FAILED announce — {message_error}")
                 continue
+            message = _render_template(message, template_context if isinstance(template_context, dict) else {})
             targets = _resolve_announce_targets(rc, action.get("targets"))
             notes.append(f"Announced: '{message[:80]}' to {len(targets)} target(s)")
             _announce_async(message, targets, _normalize_tts_audio_scene(action.get("audio_scene")))
@@ -3021,8 +3435,8 @@ def _execute_actions(client: Any, automation: Dict[str, Any], actions: Any, dept
                 priority = _text(action.get("priority")) or "normal"
                 dispatch_notification_sync(
                     _text(action.get("platform")) or "webui",
-                    _text(action.get("title")) or None,
-                    _text(action.get("message")),
+                    _render_template(_text(action.get("title")) or None, template_context if isinstance(template_context, dict) else {}),
+                    _render_template(_text(action.get("message")), template_context if isinstance(template_context, dict) else {}),
                     targets=action.get("targets") if isinstance(action.get("targets"), dict) else None,
                     origin={"platform": MODULE_KEY, "user": MODULE_KEY, "user_id": MODULE_KEY},
                     meta={"automation": _text(automation.get("name")), "priority": priority},
@@ -3039,16 +3453,25 @@ def _execute_actions(client: Any, automation: Dict[str, Any], actions: Any, dept
             notes.extend(_execute_camera_ai_action(rc, automation, action))
         elif action_type == "device":
             notes.extend(_execute_device_action(rc, action))
+        elif action_type == "webhook":
+            notes.extend(_execute_webhook_action(rc, automation, action, template_context))
         elif action_type == "ask_yes_no":
-            pending_id = _register_pending(rc, automation, action)
-            message = _text(action.get("message"))
+            message = _render_template(_text(action.get("message")), template_context if isinstance(template_context, dict) else {})
+            pending_id = _register_pending(rc, automation, action, question_override=message)
             targets = _resolve_announce_targets(rc, action.get("targets"))
             notes.append(f"Asked via announcement (pending response {pending_id}): '{message[:80]}' to {len(targets)} target(s)")
             _announce_async(message, targets, _normalize_tts_audio_scene(action.get("audio_scene")))
     return notes
 
 
-def _execute_automation(client: Any, auto_id: str, definition: Dict[str, Any], meta: Dict[str, Any], trigger_detail: str) -> Dict[str, Any]:
+def _execute_automation(
+    client: Any,
+    auto_id: str,
+    definition: Dict[str, Any],
+    meta: Dict[str, Any],
+    trigger_detail: str,
+    run_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     rc = client if client is not None else _redis()
     name = _text(definition.get("name")) or auto_id
     cooldown = max(0.0, _as_float(definition.get("cooldown_seconds"), _as_float(_setting(rc, "default_cooldown_seconds", 1800), 1800)))
@@ -3060,7 +3483,7 @@ def _execute_automation(client: Any, auto_id: str, definition: Dict[str, Any], m
     _save_meta(rc, auto_id, meta)
     _log_activity(rc, auto_id, name, "run_started", trigger_detail)
     try:
-        notes = _execute_actions(rc, definition, definition.get("actions"))
+        notes = _execute_actions(rc, definition, definition.get("actions"), template_context=run_context)
         meta["last_result"] = "; ".join(notes) if notes else "no actions executed"
         _log_activity(rc, auto_id, name, "run_finished", meta["last_result"])
     except Exception as exc:
@@ -3098,7 +3521,7 @@ def _pending_busy_extension(client: Any, auto_id: str) -> float:
 # pending yes/no response windows
 # ---------------------------------------------------------------------------
 
-def _register_pending(client: Any, automation: Dict[str, Any], action: Dict[str, Any]) -> str:
+def _register_pending(client: Any, automation: Dict[str, Any], action: Dict[str, Any], question_override: str = "") -> str:
     rc = client if client is not None else _redis()
     settings_timeout = _as_float(_setting(rc, "default_response_timeout_seconds", 120), 120)
     timeout = min(900.0, max(15.0, _as_float(action.get("timeout_seconds"), settings_timeout)))
@@ -3107,7 +3530,7 @@ def _register_pending(client: Any, automation: Dict[str, Any], action: Dict[str,
         "id": pending_id,
         "automation_id": _text(automation.get("id")),
         "automation_name": _text(automation.get("name")),
-        "question": _text(action.get("message")),
+        "question": question_override or _text(action.get("message")),
         "timeout_seconds": timeout,
         "registered_at": time.time(),
         "deadline": time.time() + timeout,
@@ -3251,6 +3674,95 @@ def _process_pending(client: Any) -> None:
             _save_meta(rc, automation_id, meta)
         except Exception:
             pass
+        _record_pending_outcome(rc, automation_id, verdict)
+
+
+def _record_pending_outcome(rc: Any, auto_id: str, verdict: str) -> None:
+    """Nuisance damping (§15.4.4): unanswered ask_yes_no windows progressively widen
+    the automation's cooldown; a real answer resets the counter (cooldown stays
+    until an explicit undamp via toggle or the WebUI card)."""
+    if not auto_id:
+        return
+    try:
+        metas = _load_meta(rc)
+        meta = metas.get(auto_id) or {}
+        automations = _load_automations(rc)
+        definition = automations.get(auto_id)
+        if not isinstance(definition, dict):
+            _save_meta(rc, auto_id, meta)
+            return
+        if verdict in ("yes", "no"):
+            if _as_int(meta.get("unanswered_count"), 0) > 0:
+                meta["unanswered_count"] = 0
+                _save_meta(rc, auto_id, meta)
+            return
+        count = _as_int(meta.get("unanswered_count"), 0) + 1
+        meta["unanswered_count"] = count
+        _save_meta(rc, auto_id, meta)
+        threshold = max(1, _as_int(_setting(rc, "damping_unanswered_threshold", 3), 3))
+        if count % threshold != 0:
+            return
+        cap = max(60.0, _as_float(_setting(rc, "damping_cooldown_max_seconds", 86400.0), 86400.0))
+        settings_default = max(0.0, _as_float(_setting(rc, "default_cooldown_seconds", 1800.0), 1800.0))
+        current = max(0.0, _as_float(definition.get("cooldown_seconds"), settings_default))
+        widened = min(cap, max(60.0, current * 2.0))
+        if widened <= current and current >= cap:
+            return
+        metas = _load_meta(rc)
+        meta = metas.get(auto_id) or {}
+        meta["pre_damp_cooldown"] = current if "pre_damp_cooldown" not in meta else meta.get("pre_damp_cooldown")
+        meta["last_auto_cooldown"] = widened
+        meta["unanswered_count"] = count
+        _save_meta(rc, auto_id, meta)
+        definition = dict(definition)
+        definition["cooldown_seconds"] = widened
+        rc.hset(AUTOMATIONS_KEY, auto_id, json.dumps(definition, separators=(",", ":"), default=str))
+        _log_activity(rc, auto_id, _text(definition.get("name")), "damped",
+                      f"unanswered {count} — cooldown widened to {widened:.0f}s")
+        _notify_damping(rc, _text(definition.get("name")), count, widened)
+    except Exception:
+        logger.exception("damping update failed for %s", auto_id)
+
+
+def _notify_damping(rc: Any, name: str, count: int, widened: float) -> None:
+    try:
+        from notify.core import dispatch_notification_sync
+
+        dispatch_notification_sync(
+            "webui",
+            "An automation is being muted",
+            f"'{name}' has gone unanswered {count} times — its cooldown was widened to "
+            f"{widened:.0f}s. Answer one of its questions, or toggle it, to reset damping.",
+            origin={"platform": MODULE_KEY, "user": MODULE_KEY, "user_id": MODULE_KEY},
+            meta={"automation": name, "priority": "normal"},
+        )
+    except Exception:
+        logger.debug("damping notification not delivered: %s", name)
+
+
+def _undamp_automation(rc: Any, auto_id: str) -> Tuple[bool, str]:
+    """Restore a damped automation: original cooldown back, counters cleared."""
+    rc = rc if rc is not None else _redis()
+    automations = _load_automations(rc)
+    definition = automations.get(auto_id)
+    if not isinstance(definition, dict):
+        return False, f"No automation '{auto_id}'"
+    was_damped = _as_float(_load_meta(rc).get(auto_id, {}).get("last_auto_cooldown"), 0.0) > 0
+    metas = _load_meta(rc)
+    meta = metas.get(auto_id) or {}
+    pre = meta.pop("pre_damp_cooldown", None)
+    meta.pop("last_auto_cooldown", None)
+    meta["unanswered_count"] = 0
+    _save_meta(rc, auto_id, meta)
+    definition = dict(definition)
+    if pre:
+        definition["cooldown_seconds"] = _as_float(pre, 1800.0)
+    else:
+        definition.pop("cooldown_seconds", None)
+    rc.hset(AUTOMATIONS_KEY, auto_id, json.dumps(definition, separators=(",", ":"), default=str))
+    if was_damped:
+        _log_activity(rc, auto_id, _text(definition.get("name")), "undamped", "")
+    return True, "damping reset"
 
 
 # ---------------------------------------------------------------------------
@@ -3285,6 +3797,7 @@ def _evaluate_conditions(
     definition: Dict[str, Any],
     meta: Dict[str, Any],
     state_since: Dict[str, float],
+    run_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
     rc = client if client is not None else _redis()
     conditions = definition.get("conditions") if isinstance(definition.get("conditions"), list) else []
@@ -3316,9 +3829,58 @@ def _evaluate_conditions(
             if not expect_people and seen:
                 return False, f"people seen — {detail}"
         elif condition_type == "camera_vision":
-            passed, detail = _evaluate_camera_vision(rc, condition)
-            if not passed:
+            hold_seconds = max(0.0, _as_float(condition.get("hold_seconds"), 0.0))
+            if hold_seconds <= 0:
+                passed, detail = _evaluate_camera_vision(rc, condition)
+                if not passed:
+                    return False, detail
+                continue
+            # sustained-pose arming: the verdict must hold continuously. Trackers ride the
+            # same state_since map as entity arming ("<auto_id>:camera:<camera>:<prompt>";
+            # ":check_ts"/":verdict" side keys cache the last verdict between check_seconds
+            # windows so an armed condition snapshots at most once per window, not per tick).
+            camera = _text(condition.get("camera"))
+            prompt = _text(condition.get("prompt")) or "Is at least one person visible in this image?"
+            key = f"{auto_id}:camera:{camera}:{prompt}"
+            check_key = key + ":check_ts"
+            verdict_key = key + ":verdict"
+            check_seconds = max(0.0, _as_float(condition.get("check_seconds"), 60.0))
+            now = time.time()
+            last_check = _as_float(state_since.get(check_key), 0.0)
+            if last_check <= 0 or now - last_check >= check_seconds:
+                passed, detail = _evaluate_camera_vision(rc, condition)
+                state_since[check_key] = now
+                state_since[verdict_key] = 1.0 if passed else 0.0
+                if not passed:
+                    state_since.pop(key, None)
+                    return False, detail
+            else:
+                passed = _as_float(state_since.get(verdict_key), 0.0) > 0.5
+                if not passed:
+                    return False, "cached camera verdict: not passed (arming continues)"
+            since = _as_float(state_since.get(key), 0.0)
+            if since <= 0:
+                state_since[key] = now
+                return False, f"camera verdict armed (holding {hold_seconds:.0f}s)"
+            held = now - since
+            if held < hold_seconds:
+                return False, f"camera verdict held {held:.0f}s of {hold_seconds:.0f}s"
+            state_since.pop(key, None)
+            state_since.pop(check_key, None)
+            state_since.pop(verdict_key, None)
+        elif condition_type == "camera_face":
+            person = _text(condition.get("person"))
+            mode = _token(condition.get("mode") or "any_person")
+            matched, detail, matched_name = _camera_person_check(
+                rc,
+                _text(condition.get("camera")),
+                person if mode == "named" else "",
+                lookback_seconds=_as_float(condition.get("lookback_seconds"), 60.0),
+            )
+            if not matched:
                 return False, detail
+            if matched_name and isinstance(run_context, dict):
+                run_context["person"] = matched_name
         elif condition_type == "presence":
             tracker_wanted = _text(condition.get("tracker")).lower()
             state_wanted = _text(condition.get("state") or "home").lower()
@@ -3489,11 +4051,12 @@ def _tick(client: Any) -> None:
         due, trigger_detail = _trigger_due(rc, auto_id, definition, meta, state_since, state_seen, edge_since)
         if not due:
             continue
-        passed, condition_detail = _evaluate_conditions(rc, auto_id, definition, meta, state_since)
+        run_context: Dict[str, Any] = {}
+        passed, condition_detail = _evaluate_conditions(rc, auto_id, definition, meta, state_since, run_context)
         if not passed:
             continue
         _log_activity(rc, auto_id, _text(definition.get("name")), "triggered", f"{trigger_detail}; {condition_detail}")
-        _execute_automation(rc, auto_id, definition, meta, trigger_detail)
+        _execute_automation(rc, auto_id, definition, meta, trigger_detail, run_context)
     # persist arming trackers without clobbering metas freshly saved by runs this tick
     for auto_id in automations:
         own_since = {k: v for k, v in state_since.items() if k.startswith(f"{auto_id}:")}
@@ -3524,6 +4087,12 @@ def run(stop_event=None) -> None:
         own_event = True
     logger.info("automation ga core runner started")
     rc = _redis()
+    try:
+        seeded = _seed_builtins(rc)
+        if seeded:
+            logger.info("automation ga core seeded %d builtin automations (disabled)", len(seeded))
+    except Exception:
+        logger.exception("builtin seeding failed")
     while not stop_event.is_set():
         poll = _poll_seconds(rc)
         try:
@@ -3542,20 +4111,26 @@ def run(stop_event=None) -> None:
 # Hydra kernel tools (authoring surface for the LLM)
 # ---------------------------------------------------------------------------
 
-def _capabilities_document(client: Any = None) -> str:
+def _capabilities_document(client: Any = None, include_entities: bool = True) -> str:
     rc = client if client is not None else _redis()
     entities = _ha_entities(rc)
     sample_rows = []
-    for entity_id, row in sorted(entities.items())[:80]:
+    for entity_id, row in sorted(entities.items())[:80 if include_entities else 0]:
         friendly = row.get("friendly_name") or ""
         sample_rows.append(f"{entity_id} = {row.get('state')}" + (f" ({friendly})" if friendly else ""))
-    entity_block = "\n".join(sample_rows) if sample_rows else "(no cached entities yet)"
+    entity_block = "(skipped: include_entities=false)" if not include_entities else (
+        "\n".join(sample_rows) if sample_rows else "(no cached entities yet)")
     registry = _registry(rc)
     camera_rows = [
         f"{row.get('label')} — {row.get('value')}"
         for row in _camera_device_options(registry)[:40]
     ]
     camera_block = "\n".join(camera_rows) if camera_rows else "(no camera-capable devices in the integration registry)"
+    sat_options = _announcement_options()
+    sat_rows = [f"{row.get('label')} — {row.get('value')}" for row in sat_options[:30]]
+    sat_block = "\n".join(sat_rows) if sat_rows else "(no announcement targets resolved)"
+    notify_services = _ha_notify_services(rc)
+    notify_block = "\n".join(notify_services[:40]) if notify_services else "(no HA notify services discovered)"
     return f"""AUTOMATION DEFINITION SCHEMA (Generative Agent)
 An automation is a JSON object executed by the deterministic Generative Agent runner.
 
@@ -3578,7 +4153,15 @@ OPTIONAL:
     {{"type": "entity_state", "entity": "...", "attribute": "current_temperature", "match": "above", "value": 27}}
     {{"type": "camera_people", "camera": "great room", "lookback_seconds": 180, "expect_people": false}}   (UniFi Protect person detection)
     {{"type": "camera_vision", "camera": "front door", "prompt": "Is at least one person visible?", "expect": true, "media_mode": "image"}}
-        (snapshots/clips the camera and asks the vision model a YES/NO question)
+        (snapshots/clips the camera and asks the vision model a YES/NO question;
+         "hold_seconds": 900 keeps arming while the verdict passes continuously — the condition only
+         passes after that many seconds of one verdict, reset by any failing/unknown check;
+         "check_seconds": 60 bounds how often an armed hold re-snapshots, default 60)
+    {{"type": "camera_face", "camera": "hallway", "mode": "named", "person": "Alex", "lookback_seconds": 60}}
+        (mode any_person = a Protect person event seen on that camera within lookback;
+         mode named = snapshot + Face ID identity match on 'person' — needs Face ID enabled,
+         degrades to any-person otherwise; when named matches, {{person}} may be used in
+         announce/notify/webhook text anywhere in that run)
     {{"type": "presence", "tracker": "alice phone", "state": "home"}}                                     (BLE presence)
     {{"type": "time_window", "after": "22:00", "before": "06:00"}}
   "actions": list — one of:
@@ -3592,6 +4175,9 @@ OPTIONAL:
     {{"type": "ask_yes_no", "targets": "all_satellites", "message": "...", "timeout_seconds": 120,
       "yes_actions": [...], "no_actions": [...], "unanswered_actions": [...]}}           (announces, listens for a spoken yes/no)
     {{"type": "notify", "platform": "webui", "title": "...", "message": "...", "priority": "normal"}}    (priority: low | normal | high | urgent)
+    {{"type": "webhook", "url": "https://example.internal/escalate", "payload": {{"automation": "{{{{"person"}}}}"}}}}
+        (one outbound HTTP call: POST, PUT, PATCH or GET; payload/headers templated with {{person}}/{{vision}};
+         send pushes via Home Assistant with call_service instead: domain "notify", service "notify.mobile_app_<phone>")
     {{"type": "wait", "seconds": 5}}
     {{"type": "camera_ai", "camera": "front door", "media_mode": "image", "vision_prompt": "...", "face_id": false,
      "announce": {{"message": "At the door: {{vision}} — {{person}}", "targets": "all_satellites"}},
@@ -3609,7 +4195,7 @@ RULES:
   invent state names for a sensor.
 - camera_ai and camera_vision run the vision model and may block the runner for up to ~90s.
 - camera devices are looked up in the integration registry: encoded "provider|device_id", or a name/room substring.
-- ask_yes_no branches may only contain call_service/announce/notify/wait.
+- ask_yes_no branches may only contain call_service/announce/notify/webhook/wait.
 Validate with automation_validate, then save with automation_create.
 
 CURRENT HOME ASSISTANT ENTITIES (entity_id = state):
@@ -3617,6 +4203,13 @@ CURRENT HOME ASSISTANT ENTITIES (entity_id = state):
 
 CAMERA DEVICES (name — provider|device_id):
 {camera_block}
+
+ANNOUNCEMENT TARGETS (label — target string for announce/ask_yes_no 'targets'):
+{sat_block}
+
+HA NOTIFY SERVICES (discovered; companion-app phone pushes are here. Send via
+call_service with domain "notify" and service "<the part after notify.>"):
+{notify_block}
 """
 
 
@@ -3697,10 +4290,10 @@ def run_hydra_kernel_tool(
 
     if tool == "automation_capabilities":
         include_entities = bool(args.get("include_entities", True))
-        doc = _capabilities_document(rc)
-        if not include_entities:
-            doc = doc.split("CURRENT HOME ASSISTANT ENTITIES")[0]
-        return {"ok": True, "facts": ["Automation definition schema returned"], "data": {"schema": doc}, "say_hint": "Use the schema to build the automation definition."}
+        doc = _capabilities_document(rc, include_entities=include_entities)
+        if include_entities:
+            return {"ok": True, "facts": ["Automation definition schema returned"], "data": {"schema": doc}, "say_hint": "Use the schema to build the automation definition."}
+        return {"ok": True, "facts": ["Automation definition schema returned; entity listing skipped — call with include_entities true for it."], "data": {"schema": doc}, "say_hint": "Use the schema to build the automation definition."}
 
     if tool == "automation_entity_states":
         requested = [_text(args.get("entity"))] if _text(args.get("entity")) else []
@@ -3829,6 +4422,13 @@ def run_hydra_kernel_tool(
         errors, warnings = validate_definition(definition, rc)
         if errors:
             return {"ok": False, "error": {"code": "invalid_definition", "message": "; ".join(errors)}, "facts": errors, "say_hint": "Fix the definition errors and try again."}
+        existing = automations[auto_id]
+        if _bool(existing.get("builtin")):
+            # builtin identity is not user-editable: an update may tune the rest
+            # but cannot un-builtin it or orphan its id suffix
+            definition = dict(definition)
+            definition["builtin"] = True
+            definition["builtin_id"] = _text(existing.get("builtin_id"))
         definition = dict(definition)
         definition["id"] = auto_id
         rc.hset(AUTOMATIONS_KEY, auto_id, json.dumps(definition, separators=(",", ":"), default=str))
@@ -3841,6 +4441,8 @@ def run_hydra_kernel_tool(
         if auto_id not in automations:
             return {"ok": False, "error": {"code": "not_found", "message": f"No automation '{auto_id}'"}, "say_hint": "List automations to find the right id."}
         name = _text(automations[auto_id].get("name"))
+        if _bool(automations[auto_id].get("builtin")):
+            return {"ok": False, "error": {"code": "builtin", "message": f"'{name}' is a builtin automation — edit or disable it instead of deleting it."}, "say_hint": "Report that builtins are edited or disabled, not deleted."}
         rc.hdel(AUTOMATIONS_KEY, auto_id)
         rc.hdel(META_KEY, auto_id)
         _log_activity(rc, auto_id, name, "deleted", "")
@@ -3851,10 +4453,14 @@ def run_hydra_kernel_tool(
         automations = _load_automations(rc)
         if auto_id not in automations:
             return {"ok": False, "error": {"code": "not_found", "message": f"No automation '{auto_id}'"}, "say_hint": "List automations to find the right id."}
-        definition = dict(automations[auto_id])
         enabled = args.get("enabled")
         if enabled is None:
-            enabled = not _automation_enabled(definition)
+            enabled = not _automation_enabled(automations[auto_id])
+        if bool(enabled):
+            # toggling on clears any auto-widened cooldown (damping reset)
+            _undamp_automation(rc, auto_id)
+            automations = _load_automations(rc)
+        definition = dict(automations[auto_id])
         definition["enabled"] = bool(enabled)
         rc.hset(AUTOMATIONS_KEY, auto_id, json.dumps(definition, separators=(",", ":"), default=str))
         state_word = "enabled" if _automation_enabled(definition) else "disabled"
@@ -3870,10 +4476,10 @@ def run_hydra_kernel_tool(
         metas = _load_meta(rc)
         meta = _meta_for(metas, auto_id)
         state_since: Dict[str, float] = {}
-        passed, detail = _evaluate_conditions(rc, auto_id, definition, meta, state_since)
+        passed, detail = _evaluate_conditions(rc, auto_id, definition, meta, state_since, {})
         if not passed:
             return {"ok": False, "error": {"code": "conditions_not_met", "message": detail}, "say_hint": f"The automation did not run: {detail}."}
-        _execute_automation(rc, auto_id, definition, meta, "manual run")
+        _execute_automation(rc, auto_id, definition, meta, "manual run", {})
         return {"ok": True, "facts": [f"Automation '{_text(definition.get('name'))}' ran: conditions passed ({detail})"], "say_hint": "Report what the automation did."}
 
     if tool == "automation_activity":
@@ -5724,6 +6330,8 @@ def _action_label(actions: Any) -> str:
         return f"{label} on {device_ref or 'all compatible devices'}"
     if action_type == "ask_yes_no":
         return f"Ask: '{_text(action.get('message'))[:60]}'"
+    if action_type == "webhook":
+        return f"Webhook {(_text(action.get('method')) or 'POST').upper()} → {_text(action.get('url'))[:60]}"
     return action_type.replace("_", " ").title() if action_type else "—"
 
 
@@ -5767,6 +6375,12 @@ def _rule_form(
         "remove_action": "tab_delete",
         "remove_confirm": f"Delete automation '{name}'?",
     }
+    if _text(meta.get("last_auto_cooldown")) and float(meta.get("last_auto_cooldown", 0)) > 0:
+        item["actions"].append({
+            "action": "tab_undamp",
+            "label": "Reset damping",
+            "payload": {"id": auto_id},
+        })
     if _definition_form_supported(definition):
         item["save_action"] = "ga_save_automation"
         item["fields"] = _editor_fields(
@@ -5778,6 +6392,13 @@ def _rule_form(
         )
     else:
         item["detail"] = detail + " Chat-authored definition — edit it in chat with Tater."
+    if _bool(definition.get("builtin")):
+        # builtins can be edited/toggled but not deleted; edits are reversible via
+        # the card's restore-defaults action (renderer-native reset_action).
+        item["reset_action"] = "ga_restore_builtin"
+        item["reset_confirm"] = f"Restore '{name}' to its default definition? Your edits to it are lost."
+        item.pop("remove_action", None)
+        item.pop("remove_confirm", None)
     item["sections"] = [
         {
             "label": "Last Run",
@@ -5981,11 +6602,31 @@ def handle_htmlui_tab_action(
         rc.hset(AUTOMATIONS_KEY, auto_id, json.dumps(definition, separators=(",", ":"), default=str))
         _log_activity(rc, auto_id, _text(definition.get("name")), "updated", "form editor")
         return {"ok": True, "id": auto_id, "message": f"Automation '{_text(definition.get('name'))}' saved."}
-    if action in ("tab_toggle", "tab_run", "tab_delete") and auto_id not in automations:
+    if action in ("tab_toggle", "tab_run", "tab_delete", "tab_undamp") and auto_id not in automations:
         return {"ok": False, "message": f"Automation '{auto_id}' not found."}
+    if action == "ga_restore_builtin":
+        existing = automations.get(auto_id)
+        if not existing:
+            return {"ok": False, "message": f"Automation '{auto_id}' not found."}
+        builtin_id = _text(existing.get("builtin_id"))
+        canonical = next(
+            (dict(canonical_definition) for cid, _name, canonical_definition in _builtin_definitions_for_seed(rc) if cid == builtin_id),
+            None,
+        )
+        if canonical is None:
+            return {"ok": False, "message": "No builtin default definition is available for this automation."}
+        canonical["id"] = auto_id
+        enabled = _automation_enabled(existing)
+        canonical["enabled"] = enabled
+        rc.hset(AUTOMATIONS_KEY, auto_id, json.dumps(canonical, separators=(",", ":"), default=str))
+        _log_activity(rc, auto_id, _text(canonical.get("name")), "updated", "restored builtin defaults")
+        return {"ok": True, "message": f"Automation '{_text(canonical.get('name'))}' restored to its default definition."}
     if action == "tab_toggle":
         result = run_hydra_kernel_tool("automation_toggle", {"id": auto_id}, redis_client=rc)
         return {"ok": bool(result.get("ok")), "message": "; ".join(result.get("facts") or []) or "Done."}
+    if action == "tab_undamp":
+        ok, message = _undamp_automation(rc, auto_id)
+        return {"ok": ok, "message": "Damping reset." if ok else message}
     if action == "tab_run":
         result = run_hydra_kernel_tool("automation_run", {"id": auto_id}, redis_client=rc)
         message = "; ".join(result.get("facts") or [])
@@ -6029,4 +6670,12 @@ def handle_core_webhook(
     notes = _execute_actions(rc, shell, branch) if branch else ["no actions configured for this answer"]
     _log_activity(rc, automation_id, _text(pending.get("automation_name")), f"answered_{verdict}" if verdict in ("yes", "no") else "timed_out", "webhook — " + ("; ".join(notes) if notes else "no actions"))
     rc.hdel(PENDING_KEY, pending_id)
+    try:
+        rc_meta = _load_meta(rc).get(automation_id)
+        if isinstance(rc_meta, dict):
+            rc_meta["last_answer"] = f"{verdict} (webhook)"
+            _save_meta(rc, automation_id, rc_meta)
+    except Exception:
+        pass
+    _record_pending_outcome(rc, automation_id, verdict)
     return {"ok": True, "message": f"Automation question answered '{verdict}'."}

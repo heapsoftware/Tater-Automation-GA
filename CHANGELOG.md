@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.2.0 — 2026-10-10 (minor — Phase 1 of the proactive-agent design, `specs/proactive_agent_design.md`)
+
+First slice of the proactive-agent roadmap: the LLM-authored rules are now
+backed by a small library of built-in wellbeing automations, the runner
+answers a real fall-ambush example end to end, and nuisance questions damp
+themselves. No breaking changes: every new definition field is optional and
+old automations keep validating and running unchanged.
+
+- **Features**
+  - Four builtin starter automations, seeded once per install, **disabled**:
+    *Stove left on*, *Door left open*, *Wellbeing — stuck on floor*
+    (sustained floor presence → room "are you okay?" call-out → unanswered /
+    "no" escalation via notification), and *Welcome home* (Protect person
+    event + Face ID → greeting). Builtins can be edited/toggled like any
+    automation (their edit card offers **Restore defaults**, which rewrites
+    the definition from the canonical seed), but not deleted — and the
+    WebUI card has no delete button for them.
+  - New definition field `watch_entities` (builtin-only): entities a builtin
+    scans dynamically, used by the stove/door builtins to find their target
+    entity across an install instead of shipping a hardcoded entity id.
+  - New `camera_face` condition — a person-presence tier with identity:
+    `mode: any_person` (any Protect person event on the camera within the
+    lookback) or `mode: named` (snapshot → Face ID match on `person`).
+    Face ID off degrades named → any-person with a validation warning.
+    On a named match, `{person}` is templated into the run's
+    announce/notify/ask/webhook text.
+  - `camera_vision` `hold_seconds` — sustained-verdict arming for conditions:
+    the condition passes only after that many seconds of one continuous
+    passing verdict (re-snapshots at most every `check_seconds`, default 60;
+    a failing or unknown check resets the arming). This turns "person lying
+    on the floor and not moving" into a real, runnable condition.
+  - New `webhook` leaf action — one outbound HTTP call (POST/PUT/PATCH/GET,
+    templated payload/headers, 2xx = success) for integrations that push
+    elsewhere. Allowed in ask_yes_no branches too.
+  - Nuisance damping (unsolicited-contact guard): every Nth unanswered
+    `ask_yes_no` window (default N=3, capped at 24h) progressively widens the
+    automation's cooldown, with one webui advisory per threshold crossing.
+    A real answer resets the counter; toggling or either card's reset clears
+    the widened cooldown. Settings: `damping_unanswered_threshold`,
+    `damping_cooldown_max_seconds`.
+  - Richer `automation_capabilities` discovery: the schema document now also
+    lists resolved announcement targets and the Home Assistant `notify.*`
+    services from the live `/api/services` endpoint (companion-app phone
+    pushes live there), so the authoring LLM can pick a real push target.
+    `include_entities: false` keeps the catalog/discovery sections and skips
+    only the entity listing.
+- **Tests (offline)**: smoke suite grew from 116 → 190 checks (webhook
+  transport seam, hold-arming across ticks, `camera_face` tiers + Face-ID
+  fallback, damping, builtin seeding/guards/restore, capabilities discovery);
+  the live-checklist mirror grew from 51 → 62 checks (damping exercised
+  through the real `_process_pending` timeout path, builtin card actions).
+  Both pass offline with fake Redis and stubbed externals; the remaining
+  live-only items (real TTS/push/vision on satellites, HA companion app)
+  are listed in the §11-B report as before.
+
 ## 1.1.2 — 2026-10-07 (revision)
 
 - **Fix** — WebUI automations list: `Announce ''` shown for announcements that
