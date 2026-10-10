@@ -5,7 +5,7 @@ built on the HGA "Sentinel" principle: **the LLM authors the automation
 rules, a deterministic runner executes them**. The runner never
 improvises — it only performs what a validated definition says.
 
-Version **1.4.0** · Runs on every Tater platform (webui, discord,
+Version **1.5.0** · Runs on every Tater platform (webui, discord,
 voice_core, portals, Little Spud)
 
 ## What it does
@@ -37,21 +37,27 @@ runner:
     "yes" (spoken or via the answer webhook,
     `/webhook/answer?p=<pending_id>&response=yes|no`); "no" or timeout
     skips it, and the verdict is logged.
-- **Kernel tools** — fourteen `automation_*` tools (capabilities, validate,
+- **Kernel tools** — fifteen `automation_*` tools (capabilities, validate,
   create, list, get, update, delete, toggle, run, activity,
-  entity_states, suggest_list, approve, decline) available on
+  entity_states, suggest_list, approve, decline, feedback) available on
   every platform, so the assistant can author and manage automations
   directly in chat. `automation_entity_states` looks up an entity's
   current state, the possible states learned from Home Assistant
   history, and recent transitions — real state names instead of
-  guessed ones.
+  guessed ones. `automation_feedback` records damp/stop/encourage
+  notes from chat: "stop asking about that" mutes an automation right
+  away and steers the reflection pass away from it.
 - **Reflection & suggestions** — a background reflection thread studies the
   entity journal and automation outcomes (gated so a quiet home costs no
   LLM calls), then proposes a handful of genuinely useful automations or
   tweaks. Suggestions wait in a review queue surfaced in chat and the
   WebUI; **nothing is saved until you approve it**, and declining one
   teaches the agent not to re-propose it. Optional presence-aware delivery
-  hands each person their suggestions when they're actually home.
+  hands each person their suggestions when they're actually home. The
+  reflection prompt also carries your chat feedback notes (damp/stop/
+  encourage) so the proposals follow them, when you answer an `ask_yes_no`
+  question in words the keyword pass can't parse, a one-word base-LLM
+  call classifies the answer (cached, at most one per question per tick).
 - **Persons** — a small catalog (name, BLE trackers, Face ID name, notify
   target) that gives presence-aware delivery and named camera conditions
   a consistent source of truth.

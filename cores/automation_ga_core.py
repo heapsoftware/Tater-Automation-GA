@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -3668,6 +3668,66 @@ def _classify_response(text: str) -> str:
     return ""
 
 
+_CLASSIFY_LLM_SYSTEM_PROMPT = (
+    "You classify short user replies to a home assistant's yes/no question. "
+    "Answer with exactly one word: YES, NO, or UNKNOWN."
+)
+_CLASSIFY_LLM_TIMEOUT_SECONDS = 10.0
+
+
+def _classify_response_llm(question: str, text: str, rc: Any = None) -> str:
+    """LLM-assisted yes/no classification (§15.8.2). Only called when the
+    deterministic keyword pass found nothing (negatives-first rule stays intact:
+    a keyword negative never reaches the LLM). Returns 'yes'/'no'/'unknown' or ''
+    when the LLM is unavailable or undecidable — the caller caches the verdict so
+    the same message is never re-classified."""
+    if _shared_get_primary_llm_client is None:
+        return ""
+    question = _text(question)[:400]
+    text = _text(text)[:400]
+    timeout = _CLASSIFY_LLM_TIMEOUT_SECONDS
+
+    def _run() -> str:
+        async def _chat() -> str:
+            async with _shared_get_primary_llm_client(redis_conn=rc) as llm:
+                result = await llm.chat(
+                    [
+                        {"role": "system", "content": _CLASSIFY_LLM_SYSTEM_PROMPT},
+                        {"role": "user", "content":
+                            f'The question was: "{question}"\n'
+                            f'The user said: "{text}"\n'
+                            "Does this agree (YES), refuse (NO), or is it unclear (UNKNOWN)? "
+                            "Answer with one word."},
+                    ],
+                    timeout=timeout,
+                    max_tokens=8,
+                    temperature=0.0,
+                )
+            if not isinstance(result, dict):
+                return ""
+            message = result.get("message") if isinstance(result.get("message"), dict) else {}
+            return _text(message.get("content"))
+
+        return asyncio.run(_chat())
+
+    try:
+        future = _RUNNER_EXECUTOR.submit(_run)
+        raw = future.result(timeout=timeout + 5.0)
+    except Exception as exc:
+        logger.debug("llm classification failed: %s", exc)
+        return ""
+    lowered = _text(raw).lower()
+    # same ordering as the keyword pass: undecided first, then negatives,
+    # then affirmatives ("no, don't turn it off" stays negative)
+    if re.search(r"\b(?:unknown|unclear)\b", lowered):
+        return "unknown"
+    if re.search(r"\bno\b", lowered):
+        return "no"
+    if re.search(r"\byes\b", lowered):
+        return "yes"
+    return ""
+
+
 def _pending_summaries(client: Any) -> List[Dict[str, Any]]:
     rc = client if client is not None else _redis()
     try:
@@ -3704,6 +3764,7 @@ def _process_pending(client: Any) -> None:
         conv_keys = list(rc.scan_iter(match="tater:voice:conv:*:history"))
     except Exception:
         conv_keys = []
+    conv_keys = sorted(conv_keys)
     for pending_id, raw_pending in list(raw.items()):
         pending = _json_loads(raw_pending, {})
         if not isinstance(pending, dict):
@@ -3711,10 +3772,22 @@ def _process_pending(client: Any) -> None:
             continue
         deadline = _as_float(pending.get("deadline"), 0.0)
         watermarks = pending.get("watermarks") if isinstance(pending.get("watermarks"), dict) else {}
+        classified_cache = pending.get("llm_classified") if isinstance(pending.get("llm_classified"), dict) else {}
+        pending_dirty = False
+        # Phase 5 cap: at most one LLM classification per pending window per tick;
+        # verdicts are cached per conversation key + text so a message is never
+        # re-sent to the LLM
+        llm_budget = 1
+        budget_stop: Optional[Tuple[str, int]] = None  # (conv_key, resume index)
         verdict = ""
         verdict_text = ""
         newest: Dict[str, int] = {}
         for conv_key in conv_keys:
+            if budget_stop is not None:
+                # a previous conversation consumed the LLM classification budget —
+                # leave the remaining conversations' watermarks untouched so their
+                # unclassified entries are rescanned (and judged) on the next tick
+                continue
             try:
                 length = int(rc.llen(conv_key) or 0)
             except Exception:
@@ -3729,21 +3802,51 @@ def _process_pending(client: Any) -> None:
                 entries = rc.lrange(conv_key, watermark, length - 1) or []
             except Exception:
                 continue
-            for raw_entry in entries:
+            stop_index = -1
+            for offset, raw_entry in enumerate(entries):
+                idx = watermark + offset
                 entry = _json_loads(raw_entry, {})
                 if not isinstance(entry, dict) or _text(entry.get("role")) != "user":
                     continue
-                answer = _classify_response(_history_entry_text(entry))
+                entry_text = _history_entry_text(entry)
+                answer = _classify_response(entry_text)
+                if not answer:
+                    cache_key = f"{conv_key}:{entry_text.casefold()[:160]}"
+                    previous = _text(classified_cache.get(cache_key))
+                    if previous == "yes":
+                        answer = "yes"
+                    elif previous == "no":
+                        answer = "no"
+                    elif not previous:
+                        if llm_budget > 0:
+                            llm_budget -= 1
+                            llm_verdict = _classify_response_llm(_text(pending.get("question")), entry_text, rc)
+                            classified_cache[cache_key] = llm_verdict or "unknown"
+                            pending_dirty = True
+                            if llm_verdict in ("yes", "no"):
+                                answer = llm_verdict
+                        else:
+                            # out of LLM budget and unclassified: freeze this
+                            # conversation's watermark just before it so the entry
+                            # is classified next tick instead of being consumed
+                            stop_index = idx
+                            break
                 if answer:
                     verdict = answer
-                    verdict_text = _history_entry_text(entry)
+                    verdict_text = entry_text
                     break
+            if stop_index >= 0:
+                budget_stop = (conv_key, stop_index)
+                newest[conv_key] = stop_index
+                break
             if verdict:
                 break
         if not verdict and deadline <= now:
             verdict = "unanswered"
         if not verdict:
             pending["watermarks"] = newest
+            if pending_dirty:
+                pending["llm_classified"] = classified_cache
             rc.hset(PENDING_KEY, pending_id, json.dumps(pending, separators=(",", ":"), default=str))
             continue
 
@@ -3819,19 +3922,50 @@ def _record_pending_outcome(rc: Any, auto_id: str, verdict: str) -> None:
 
 
 def _notify_damping(rc: Any, name: str, count: int, widened: float) -> None:
+    _notify_damping_reason(rc, name, widened, f"'{name}' has gone unanswered {count} times")
+
+
+def _notify_damping_reason(rc: Any, name: str, widened: float, reason: str) -> None:
     try:
         from notify.core import dispatch_notification_sync
 
         dispatch_notification_sync(
             "webui",
             "An automation is being muted",
-            f"'{name}' has gone unanswered {count} times — its cooldown was widened to "
+            f"{reason.rstrip('.')}. Its cooldown was widened to "
             f"{widened:.0f}s. Answer one of its questions, or toggle it, to reset damping.",
             origin={"platform": MODULE_KEY, "user": MODULE_KEY, "user_id": MODULE_KEY},
             meta={"automation": name, "priority": "normal"},
         )
     except Exception:
         logger.debug("damping notification not delivered: %s", name)
+
+
+def _damp_automation(rc: Any, auto_id: str, reason: str = "") -> Tuple[bool, str]:
+    """Immediately widen an automation's cooldown once (chat feedback damp, §15.7)
+    through the same doubling + pre_damp_cooldown machinery as nuisance damping."""
+    rc = rc if rc is not None else _redis()
+    definition = (_load_automations(rc) or {}).get(auto_id)
+    if not isinstance(definition, dict):
+        return False, f"No automation '{auto_id}'"
+    settings_default = max(0.0, _as_float(_setting(rc, "default_cooldown_seconds", 1800.0), 1800.0))
+    current = max(0.0, _as_float(definition.get("cooldown_seconds"), settings_default))
+    cap = max(60.0, _as_float(_setting(rc, "damping_cooldown_max_seconds", 86400.0), 86400.0))
+    widened = min(cap, max(60.0, current * 2.0))
+    metas = _load_meta(rc)
+    meta = metas.get(auto_id) or {}
+    meta["pre_damp_cooldown"] = current if "pre_damp_cooldown" not in meta else meta.get("pre_damp_cooldown")
+    meta["last_auto_cooldown"] = widened
+    _save_meta(rc, auto_id, meta)
+    definition = dict(definition)
+    definition["cooldown_seconds"] = widened
+    rc.hset(AUTOMATIONS_KEY, auto_id, json.dumps(definition, separators=(",", ":"), default=str))
+    name = _text(definition.get("name")) or auto_id
+    _log_activity(rc, auto_id, name, "damped",
+                  f"feedback damp — {reason}" if reason else "feedback damp — cooldown widened")
+    _notify_damping_reason(rc, name, widened,
+                           reason.strip() + "." if reason else f"'{name}' was damping-flagged from chat feedback")
+    return True, "cooldown widened"
 
 
 def _undamp_automation(rc: Any, auto_id: str) -> Tuple[bool, str]:
@@ -4343,6 +4477,23 @@ def _declined_digest(client: Any, limit: int = 10) -> List[str]:
     return lines
 
 
+def _feedback_notes_digest(client: Any, kinds: Tuple[str, ...] = ("damp", "stop", "encourage"), limit: int = 8) -> List[str]:
+    """Chat feedback notes (§15.7) for the reflection prompt's user-sentiment
+    block: what the user told the agent to damp, stop, or encourage — and about
+    which automation, when detectable."""
+    lines: List[str] = []
+    for row in _read_feedback(client, limit=120):
+        kind = _text(row.get("kind"))
+        if kind not in kinds:
+            continue
+        target = _text(row.get("automation_id"))
+        detail = _text(row.get("detail"))
+        lines.append(f"[{kind}] {target or 'unspecified'}: {detail}" if detail else f"[{kind}] {target or 'unspecified'}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
 def _feedback_sentiment(client: Any, limit: int = 20) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for row in _read_feedback(client, limit=limit) or []:
@@ -4756,6 +4907,54 @@ def _decline_suggestion(client: Any, suggestion_id: str) -> Dict[str, Any]:
     return {"ok": True, "message": "Suggestion declined — the agent avoids re-proposing it."}
 
 
+def _automation_feedback(rc: Any, kind: str, automation_ref: str = "", detail: str = "") -> Dict[str, Any]:
+    """Chat feedback loop (§15.7 — Phase 4): the platform LLM calls the
+    automation_feedback kernel tool when the user says things like 'stop telling
+    me that' / 'that's too often' / 'do more like that'. damp applies nuisance
+    damping immediately; all kinds land in the feedback log the reflection
+    prompt reads."""
+    rc = rc if rc is not None else _redis()
+    kind_token = _token(kind)
+    if kind_token not in ("damp", "encourage", "stop"):
+        return {"ok": False, "message": "kind must be damp, encourage or stop"}
+    detail = _text(detail)
+    ref = _text(automation_ref)
+    auto_id, auto_name = "", ""
+    if ref:
+        automations = _load_automations(rc)
+        lowered = ref.casefold()
+        if ref in automations:
+            auto_id, auto_name = ref, _text(automations[ref].get("name")) or ref
+        else:
+            for candidate_id, definition in sorted(automations.items()):
+                name = _text(definition.get("name")).casefold()
+                if name == lowered or (ref.casefold() in name):
+                    auto_id, auto_name = candidate_id, _text(definition.get("name"))
+                    break
+    if kind_token == "damp":
+        if not auto_id:
+            return {"ok": False,
+                    "message": f"could not identify an automation for '{ref or detail or 'damp'}' — pass an automation id or its exact name"}
+        ok, message = _damp_automation(rc, auto_id, detail or "chat feedback")
+        if not ok:
+            return {"ok": False, "message": message}
+        _log_feedback(rc, kind_token, auto_id,
+                      detail or (f"about '{auto_name}'" if auto_name else "no detail given"))
+        # the damp helper already logged: keep one activity row
+    else:
+        _log_feedback(rc, kind_token, auto_id,
+                      detail or (f"about '{auto_name}'" if auto_name else "no detail given"))
+        _log_activity(rc, auto_id, auto_name or "automation", f"feedback_{kind_token}",
+                      detail[:160] if detail else (f"about '{auto_name}'" if auto_name else ""))
+    state = _json_loads(rc.get(REFLECTION_STATE_KEY) or "{}", {}) or {}
+    state["declined_since_pass"] = _as_int(state.get("declined_since_pass"), 0) + (1 if kind_token == "stop" else 0)
+    _save_reflection_state(rc, state)
+    return {"ok": True, "message":
+            (f"feedback recorded for '{auto_name}'" if auto_name else "feedback recorded")
+            + (" — its cooldown was widened" if kind_token == "damp" else ""),
+            "id": auto_id}
+
+
 # ---------------------------------------------------------------------------
 # reflection pass → suggestion proposals (§15.6.1–15.6.2 — Phase 3, v1.4.0)
 # ---------------------------------------------------------------------------
@@ -4770,7 +4969,9 @@ _REFLECTION_SYSTEM_PROMPT = (
     "times while we were asleep').\n"
     "Rules: reference only entities/devices present in the provided context; prefer "
     "notifying over announcing (silent, no interruption); never repeat an automation the "
-    "user already declined (the declined list is included); rank candidates by expected "
+    "user already declined (the declined list is included), and treat the user's "
+    "damp/stop sentinel notes as hard-avoidance while encourage notes are a welcome "
+    "nudge toward similar ideas; rank candidates by expected "
     "usefulness and emit only ones that clear a real bar — if the record shows nothing "
     "worth acting on (no unaddressed pattern, nothing time-relevant, or only ideas close "
     "to previously declined ones), an empty suggestions list is a valid and often correct "
@@ -4876,6 +5077,7 @@ def _build_reflection_prompt(rc: Any) -> Tuple[str, str]:
         f"protect person events (24h): {json.dumps(digest.get('protect_person_events_24h'), default=str)}",
     ]
     declined_lines = _declined_digest(rc, limit=10)
+    feedback_notes = _feedback_notes_digest(rc, limit=8)
     sentiment = _feedback_sentiment(rc, limit=25)
     registry = _registry(rc)
     camera_rows = [f"{row.get('value')}" for row in _camera_device_options(registry)[:25]]
@@ -4898,6 +5100,11 @@ NOTIFY SERVICES: {', '.join(notify_rows) if notify_rows else '(none)'}
 
 PREVIOUSLY DECLINED (do not re-propose these):
 {chr(10).join(f"- {line}" for line in declined_lines) if declined_lines else "(none)"}
+
+USER SENTINEL NOTES (chat feedback the user gave about automations —
+'damp'/'stop' means the user is tired of it: never propose anything like it again;
+'encourage' means the user liked it, similar ideas are welcome):
+{chr(10).join(f"- {line}" for line in feedback_notes) if feedback_notes else "(none)"}
 
 USER FEEDBACK COUNTS (recent): {json.dumps(sentiment, default=str)}
 
@@ -5467,6 +5674,11 @@ def get_hydra_kernel_tools(platform: str = "", redis_client: Any = None, core_ke
             "description": "Decline one pending suggestion: recorded so reflection avoids re-proposing it.",
             "usage": '{"function":"automation_decline","arguments":{"id":"s_1234abcd"}}',
         },
+        {
+            "id": "automation_feedback",
+            "description": "Log the user's feedback about an automation so reflection adapts: kind is damp (too often / too noisy — its cooldown is widened immediately), stop (stop doing that — reflection hard-avoids it), or encourage (do more like that). Pass the automation id or its name when the user names it.",
+            "usage": '{"function":"automation_feedback","arguments":{"kind":"damp","id":"a_1234abcd","detail":"the stove announcements are too frequent"}}',
+        },
     ]
     return rows
 
@@ -5725,12 +5937,73 @@ def run_hydra_kernel_tool(
             "say_hint": "Confirm the decline" if result.get("ok") else _text(result.get("message")),
         }
 
+    if tool == "automation_feedback":
+        automation_ref = _text(args.get("id")) or _text(args.get("automation_id")) or _text(args.get("automation"))
+        result = _automation_feedback(rc, _text(args.get("kind")), automation_ref, _text(args.get("detail")))
+        out = {
+            "ok": bool(result.get("ok")),
+            "facts": [result.get("message", "Done")] if result.get("ok") else [],
+            "error": None if result.get("ok") else {"code": "feedback_failed", "message": _text(result.get("message"))},
+            "say_hint": ("Tell the user what was logged (and, for damp, that repeats will be less frequent)."
+                         if result.get("ok") else _text(result.get("message"))),
+        }
+        if result.get("ok"):
+            out["data"] = {"id": result.get("id"), "message": result.get("message")}
+        return out
+
     return None
 
 
 # ---------------------------------------------------------------------------
 # system prompt fragments
 # ---------------------------------------------------------------------------
+
+def _context_brief_fragment(rc: Any) -> str:
+    """CONTEXT BRIEF (§15.8.1 — Phase 5, v1.5.0): a compact prompt fragment —
+    live pending windows, the last activity rows, and the most striking
+    recently-ended held states from the entity journal — so the chat LLM can
+    volunteer observations ('the garage stayed open for 40 minutes earlier')
+    instead of only answering. Empty string when there is nothing to say."""
+    rc = rc if rc is not None else _redis()
+    lines: List[str] = []
+    try:
+        for row in _pending_summaries(rc)[:3]:
+            lines.append(f"Waiting for a spoken answer: '{row['question']}' — asked by {row['automation']}, about {row['seconds_left']}s left.")
+    except Exception:
+        pass
+    try:
+        for row in _read_activity(rc, limit=15):
+            line = f"{_text(row.get('ts_text'))} {_text(row.get('automation')) or 'automation'}: {_text(row.get('event'))}"
+            detail = _text(row.get("detail"))
+            if detail:
+                line += f" — {detail[:100]}"
+            lines.append(line)
+    except Exception:
+        pass
+    try:
+        held_rows = []
+        for blob in rc.lrange(JOURNAL_KEY, 0, 59):
+            row = blob if isinstance(blob, dict) else _json_loads(blob, {})
+            if isinstance(row, dict) and _as_float(row.get("held_seconds"), 0.0) >= 120.0:
+                held_rows.append(row)
+            if len(held_rows) >= 12:
+                break
+        for row in sorted(held_rows, key=lambda item: _as_float(item.get("held_seconds"), 0.0), reverse=True)[:3]:
+            lines.append(
+                f"Note: {_text(row.get('entity'))} was '{_text(row.get('from'))}' for "
+                f"{_as_float(row.get('held_seconds'), 0.0) / 60.0:.0f} min before changing to "
+                f"'{_text(row.get('to'))}' ({_text(row.get('ts_text'))})."
+            )
+    except Exception:
+        pass
+    if not lines:
+        return ""
+    return (
+        "GA CONTEXT BRIEF — recent home state from the Generative Agent runner (its "
+        "automations run deterministically; you may volunteer observations or offer a "
+        "helpful automation):\n" + "\n".join(lines[:22])
+    )
+
 
 def get_hydra_system_prompt_fragments(
     platform: str = "",
@@ -5748,7 +6021,10 @@ def get_hydra_system_prompt_fragments(
         "automation_capabilities to load the definition schema and current entity ids, and "
         "validate definitions with automation_validate before saving with automation_create. "
         "Automations run deterministically on a schedule/trigger — they do not need the user to ask again. "
-        "Camera automations (camera_vision conditions, camera_ai actions) take a few extra seconds to run."
+        "Camera automations (camera_vision conditions, camera_ai actions) take a few extra seconds to run. "
+        "If the user gives feedback about an automation — 'stop telling me that', 'that's too often', or "
+        "'do more like that' — log it with the automation_feedback kernel tool (kind damp/stop/encourage; "
+        "the automation id or its exact name if they named it)."
     )
     try:
         rc = redis_client if redis_client is not None else _redis()
@@ -5762,6 +6038,12 @@ def get_hydra_system_prompt_fragments(
             f"answer (about {first['seconds_left']}s left). If the user's message answers it (yes/no), acknowledge "
             "briefly — the Generative Agent Automation Core executes the matching action itself."
         )
+    try:
+        brief = _context_brief_fragment(_redis() if redis_client is None else redis_client)
+    except Exception:
+        brief = ""
+    if brief:
+        fragments.append(brief)
     return fragments
 
 

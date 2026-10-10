@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.5.0 — 2026-10-10 (minor — Phases 4+5 of the proactive-agent design, `specs/proactive_agent_design.md`)
+
+- **Features**
+  - New **`automation_feedback` kernel tool** (Phase 4, §15.7): chat-side
+    feedback on automations in three kinds — `damp` ("that's too chatty")
+    resolves the automation (exact id, exact name, or case-fold name
+    substring) and immediately widens its cooldown with the same doubling +
+    `pre_damp_cooldown` machinery as nuisance damping, so the user hears "an
+    automation is being muted" right away; `stop` also bumps the reflection
+    declined-since-pass counter; `encourage` is a recorded nudge. All kinds
+    are logged to a feedback journal that feeds the reflection prompt as a
+    "USER SENTINEL NOTES" block, and the reflection system prompt treats
+    damp/stop notes as hard-avoidance while encourage notes welcome similar
+    ideas.
+  - New **context-brief prompt fragment** (Phase 5, §15.8.1): a "GA CONTEXT
+    BRIEF" fragment appended to the Hydra system-prompt fragments carries
+    the pending yes/no question, the last ~15 activity rows, and the
+    top journal anomalies (states held ≥ 2 min before changing) — so chat
+    answers are grounded in what actually happened at home. Empty when
+    there is nothing to report.
+  - **LLM-assisted yes/no classification** (Phase 5, §15.8.2): when the
+    deterministic keyword pass finds nothing (negatives-first order
+    preserved), a single base-LLM call (10 s timeout, `max_tokens` 8, temp
+    0.0) answers YES/NO/UNKNOWN for the reply; verdicts are cached per
+    pending question + text so the same message is never re-sent; at most
+    **one** LLM classification per pending question per tick — a
+    budget-exhausted entry freezes that conversation's watermark and is
+    re-judged next tick instead of being consumed. "NOPE" still never
+    counts as "no", and an undecidable reply stays empty (window open).
+- No breaking changes: no definition-schema change; the feedback tool is
+  additive, the context-brief fragment is empty by default, and keyword
+  classification behavior is unchanged.
+- Tests (offline): smoke 293 → 319 checks (feedback damp/immediate
+  cooldown widen/stop counter/resolutions, sentinel notes in the
+  reflection prompt, context-brief content, classify parser, end-to-end
+  keyword-miss → one LLM classify → verdict cache → yes branch, budget +
+  resume); live-checklist mirror 93 → 103 checks (B16 feedback + context
+  brief + classification through the real `_tick`); both pass offline.
+
 ## 1.4.0 — 2026-10-10 (minor — Phase 3 of the proactive-agent design, `specs/proactive_agent_design.md`)
 
 - **Features**
