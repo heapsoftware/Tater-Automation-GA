@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.6.1 — 2026-10-11 (revision — announce reliability: subject kept, LLM-down fallback)
+
+- **Features**
+  - **`message_style` variations keep the subject device identifiable:** the
+    rephrase prompt now explicitly requires the variation to name the
+    appliance/device/room the reference is about ("dryer", "washing
+    machine") and forbids reducing it to a generic term like "laundry" or
+    "the cycle" — so a dryer-finished announcement can never be mistaken
+    for the washer's and vice versa. Phrasing freedom is unchanged; a live
+    run had produced "Pardon me, but the laundry cycle is complete." from a
+    dryer reference, which motivated this.
+  - **Reference-text fallback when generation fails:** if the base LLM is
+    unreachable, errors, or replies empty, `message_style` announcements now
+    speak the reference text itself instead of skipping (the same failure
+    previously produced `FAILED announce — could not generate announcement
+    text` and silence). New setting `message_style_fallback` (default **on**);
+    with it off the old skip behavior returns.
+- **Tests** (offline mirror — tests are local-only, never shipped)
+  - Smoke suite: LLM failure now announces the reference (default on), the
+    opt-out restores the skip behavior, and the prompt assertion requires the
+    subject-identifiability rule. 320 checks green; checklist 111/111.
+
 ## 1.6.0 — 2026-10-11 (minor — direct-HA state fallback for watched entities)
 
 - **Features**

@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -406,6 +406,12 @@ CORE_SETTINGS = {
             "type": "text",
             "default": "all_satellites",
             "description": "Targets used by announce/ask_yes_no when the automation does not set targets (all_satellites, or explicit target list).",
+        },
+        "message_style_fallback": {
+            "label": "LLM announce fallback to reference text",
+            "type": "bool",
+            "default": True,
+            "description": "When the base LLM cannot write a message_style variation (unreachable, error, or empty reply), announce the reference text itself instead of skipping the announcement.",
         },
         "max_activity_rows": {
             "label": "Activity rows kept",
@@ -2902,9 +2908,13 @@ _ANNOUNCE_GEN_SYSTEM_PROMPT = (
     "You write short spoken home-automation announcements for a home assistant's "
     "text-to-speech. You are given a reference announcement. Write ONE fresh "
     "variation of it: keep the same meaning, facts and tone, but use different "
-    "words and phrasing — never copy the reference word for word. Output only the "
-    "announcement text: no quotes, no labels, no preamble. One to three short "
-    "sentences of plain spoken language."
+    "words and phrasing — never copy the reference word for word. Naming matters: "
+    "if the reference names a subject (the appliance, device or room it is about), "
+    "the variation must keep that subject identifiable — name it (\"dryer\", "
+    "\"washing machine\", \"the kitchen lights\") and never reduce it to a generic "
+    "term (\"laundry\", \"the cycle\", \"things\"). Devices that finish in the same "
+    "room sound identical otherwise. Output only the announcement text: no quotes, "
+    "no labels, no preamble. One to three short sentences of plain spoken language."
 )
 _ANNOUNCE_GEN_TIMEOUT_SECONDS = 25.0
 _ANNOUNCE_GEN_MAX_CHARS = 600
@@ -2963,12 +2973,20 @@ def _resolve_announce_message(action: Dict[str, Any], client: Any = None) -> Tup
             return random.choice(options), ""
     reference = _text(action.get("message_style"))
     if reference:
+        error = ""
         try:
             generated = _generate_announce_text(reference, client).strip().strip("\"'“”‘’").strip()
         except Exception as exc:
-            return None, f"could not generate announcement text: {exc}"
+            generated = ""
+            error = f"could not generate announcement text: {exc}"
+        if not generated and _bool(_setting(client, "message_style_fallback", True), True):
+            logger.warning(
+                "announce generation failed (%s) — announcing the reference text instead",
+                error or "the base LLM returned no announcement text",
+            )
+            return reference, ""
         if not generated:
-            return None, "the base LLM returned no announcement text"
+            return None, error or "the base LLM returned no announcement text"
         if len(generated) > _ANNOUNCE_GEN_MAX_CHARS:
             generated = generated[:_ANNOUNCE_GEN_MAX_CHARS].rsplit(" ", 1)[0] + "…"
         return generated, ""
@@ -3080,7 +3098,7 @@ def _validate_actions(
                     if len(_text(action.get("message_style"))) < 12:
                         warnings.append(f"{label}: 'message_style' is very short — enter the reference message (or a clear description of its tone and content)")
                     if _shared_get_primary_llm_client is None:
-                        warnings.append(f"{label}: 'message_style' needs the Tater base LLM, which is unavailable in this runtime — the announcement will fail at run time")
+                        warnings.append(f"{label}: 'message_style' needs the Tater base LLM, which is unavailable in this runtime — with the default message_style_fallback on, the announcement uses the reference text; with it off, the announcement fails at run time")
             if action_type == "ask_yes_no":
                 yes_actions = action.get("yes_actions")
                 if not isinstance(yes_actions, list) or not yes_actions:
