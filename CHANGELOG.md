@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.6.0 — 2026-10-11 (minor — direct-HA state fallback for watched entities)
+
+- **Features**
+  - **Direct-HA state fallback for `entity_state` triggers and conditions:**
+    the Tater HA state cache is event-fed only (websocket `state_changed`
+    events, no initial state sync on connect), so a runner or container
+    restart pins watched entities to their pre-gap state until each one's
+    next change — and an edge trigger can miss whole cycles (e.g. a washer's
+    `running` state landing inside the restart gap, which is exactly how a
+    washer-finished automation silently never fired). Now every
+    `entity_state` trigger/condition evaluation re-checks the watched entity
+    against `GET /api/states/<entity_id>` on the same REST channel and
+    credentials the core already uses for history and service calls,
+    throttled per entity by the new `state_fallback_seconds` setting
+    (default 10s, floor 3). When HA is ahead of the cached row, the REST
+    truth is adopted **and written back into the shared runtime cache in the
+    provider's own record shape** (with a `reconciled_by` marker), so the
+    entity journal, capability documents and all other readers reconcile
+    too. In-sync rows pass through untouched; `state_fallback` (default on)
+    disables it; any REST failure degrades silently to the plain cache.
+- **Tests** (offline mirror — tests are local-only, never shipped)
+  - New checklist block B5.5 (8 checks): in-sync pass-through + throttling,
+    adoption of a lagged row, provider-shape write-back with `reconciled_by`,
+    end-to-end re-arm + fire of an edge trigger purely via REST truth, the
+    `state_fallback=false` opt-out, and silent degradation on HA 404.
+- **Notes**
+  - Spec doc: corrected the `entity_state` state-match wording (exact string,
+    case-sensitive — it previously claimed case-insensitive matching, which
+    the code has never done).
+
 ## 1.5.0 — 2026-10-10 (minor — Phases 4+5 of the proactive-agent design, `specs/proactive_agent_design.md`)
 
 - **Features**

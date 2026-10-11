@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -192,6 +192,16 @@ _HA_HISTORY_WINDOW_HOURS = 72
 _HA_HISTORY_TIMEOUT_SECONDS = 20.0
 _HA_HISTORY_MAX_ENTITIES_PER_CALL = 50
 _HA_HISTORY_MAX_ROWS = 20_000
+# direct-REST state fallback: the integration runtime cache is event-fed
+# (state_changed over the HA websocket, no initial sync on connect), so a
+# restart or dropped websocket leaves watched-entity rows stale until each
+# entity's next state change and edge triggers can miss whole cycles
+# (e.g. a washer's 'running' landing in the restart gap). Watched entities
+# are re-checked against GET /api/states/{entity_id} on this cadence and the
+# truth is adopted (and written back to the shared cache) when HA is ahead.
+_HA_STATE_FALLBACK_TIMEOUT_SECONDS = 8.0
+_HA_STATE_FALLBACK_MIN_SECONDS = 3.0
+_HA_STATE_FALLBACK_MAX_SECONDS = 600.0
 _STATE_CATALOG_TTL_SECONDS = 60.0
 _STATE_CATALOG_MAX_STATES = 25
 _STATE_CATALOG_MAX_TRANSITIONS = 12
@@ -366,6 +376,18 @@ CORE_SETTINGS = {
             "type": "number",
             "default": 10,
             "description": "How often the runner checks triggers and pending responses.",
+        },
+        "state_fallback": {
+            "label": "Direct-HA state fallback",
+            "type": "bool",
+            "default": True,
+            "description": "Re-check entities referenced by entity_state triggers/conditions against the HA REST API and adopt the true state (writing it back to the shared runtime cache) when the event-fed cache lags behind HA — recovers triggers after a runner/integration restart or a dropped websocket.",
+        },
+        "state_fallback_seconds": {
+            "label": "State fallback refresh interval (seconds)",
+            "type": "number",
+            "default": 10,
+            "description": "Minimum time between direct HA REST re-checks per watched entity when state_fallback is on.",
         },
         "default_response_timeout_seconds": {
             "label": "Default response timeout (seconds)",
@@ -1349,9 +1371,108 @@ def _ha_entities(client: Any = None) -> Dict[str, Dict[str, Any]]:
 
 def _ha_entity_state(client: Any, entity_id: str) -> Tuple[Optional[str], float]:
     row = _ha_entities(client).get(_text(entity_id))
+    row = _ha_state_follower_row(client, entity_id, row)
     if not row:
         return None, 0.0
     return row.get("state"), float(row.get("updated_at") or 0.0)
+
+
+_STATE_FALLBACK_LOCK = threading.Lock()
+_STATE_FALLBACK_CHECKS: Dict[str, float] = {}
+_STATE_FALLBACK_LOGGED: Dict[str, float] = {}
+
+
+def _ha_state_follower_row(client: Any, entity_id: Any, row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Adopt the true HA state when the event-fed runtime cache lags behind.
+
+    The integration runtime cache only receives state_changed websocket events
+    — with no initial sync on connect — so a restart/dropped websocket pins
+    watched entities to their pre-gap state and edge triggers can miss whole
+    cycles. This re-checks the entity against GET /api/states/{entity_id} on
+    a per-entity cadence (reusing the same REST channel and credentials the
+    core already uses for /api/history and service calls) and, when HA is
+    ahead (state differs, or last_changed outruns the cache's updated_at),
+    adopts the REST truth and writes it back into the shared cache in the
+    provider's own record shape — so triggers, conditions and the entity
+    journal all reconcile. Never raises; returns the input row unchanged on
+    any failure, so offline/broken HA always degrades to the plain cache.
+    """
+    if requests is None:
+        return row
+    entity_id = _text(entity_id)
+    if not entity_id:
+        return row
+    rc = client if client is not None else _redis()
+    if not _bool(_setting(rc, "state_fallback", True), True):
+        return row
+    interval = _as_float(_setting(rc, "state_fallback_seconds", 10), 10.0)
+    interval = max(_HA_STATE_FALLBACK_MIN_SECONDS, min(_HA_STATE_FALLBACK_MAX_SECONDS, interval))
+    now = time.time()
+    with _STATE_FALLBACK_LOCK:
+        if now - _STATE_FALLBACK_CHECKS.get(entity_id, 0.0) < interval:
+            return row
+        _STATE_FALLBACK_CHECKS[entity_id] = now
+    base, token = _ha_rest_config(rc)
+    if not base or not token:
+        return row
+    try:
+        response = requests.get(
+            f"{base.rstrip('/')}/api/states/{quote(entity_id)}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=_HA_STATE_FALLBACK_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            logger.warning("state fallback for %s failed with HTTP %s", entity_id, response.status_code)
+            return row
+        raw = response.json()
+    except Exception as exc:
+        logger.warning("state fallback for %s failed: %s", entity_id, exc)
+        return row
+    if not isinstance(raw, dict):
+        return row
+    new_state = _text(raw.get("state"))
+    if not new_state:
+        return row
+    old_state = _text((row or {}).get("state"))
+    old_updated = _as_float((row or {}).get("updated_at"), 0.0)
+    last_changed = _ha_history_timestamp(raw.get("last_changed") or raw.get("last_updated") or raw.get("last_reported"))
+    if row is not None and new_state == old_state and last_changed <= old_updated + 2.0:
+        return row  # cache already reflects HA — the event stream did its job
+    fresh: Dict[str, Any] = {
+        "entity_id": entity_id,
+        "state": new_state,
+        "attributes": raw.get("attributes") if isinstance(raw.get("attributes"), dict) else {},
+        "friendly_name": _text(raw.get("attributes", {}).get("friendly_name")),
+        "updated_at": now,
+        "fallback_rest": True,
+    }
+    try:
+        rc.hset(
+            INTEGRATION_STATES_KEY,
+            f"homeassistant:{entity_id}",
+            json.dumps(
+                {
+                    "provider": "homeassistant",
+                    "id": entity_id,
+                    "updated_at": now,
+                    "reconciled_by": MODULE_KEY,
+                    "payload": {
+                        "entity_id": entity_id,
+                        "state": new_state,
+                        "attributes": fresh["attributes"],
+                        "raw": raw,
+                    },
+                },
+                separators=(",", ":"), default=str,
+            ),
+        )
+    except Exception as exc:
+        logger.warning("could not write back reconciled state for %s: %s", entity_id, exc)
+    last_logged = _as_float(_STATE_FALLBACK_LOGGED.get(entity_id), 0.0)
+    if now - last_logged > 300.0:  # log adoption sparsely: restart recovery, not steady-state chatter
+        _STATE_FALLBACK_LOGGED[entity_id] = now
+        logger.info("state fallback adopted HA state for %s: %r -> %r", entity_id, old_state, new_state)
+    return fresh
 
 
 def _walk_values(value: Any, *, depth: int = 0) -> Iterable[Tuple[str, Any]]:
@@ -1405,7 +1526,8 @@ def _entity_state_match(client: Any, spec: Dict[str, Any]) -> Tuple[bool, str]:
     (match: equals | not_equals | contains | above | below). Returns (satisfied, detail).
     """
     entity_id = _text(spec.get("entity"))
-    row = _ha_entities(client).get(entity_id)
+    rc = client if client is not None else _redis()
+    row = _ha_state_follower_row(rc, entity_id, _ha_entities(rc).get(entity_id))
     if row is None:
         return False, f"entity '{entity_id}' has no cached state"
     attribute = _text(spec.get("attribute"))
@@ -4143,7 +4265,7 @@ def _edge_trigger_due(
     key = f"{auto_id}:{entity_id}"
     if not entity_id:
         return False, ""
-    row = _ha_entities(rc).get(entity_id)
+    row = _ha_state_follower_row(rc, entity_id, _ha_entities(rc).get(entity_id))
     current = _text(row.get("state")) if row else ""
     if not current:
         return False, ""
