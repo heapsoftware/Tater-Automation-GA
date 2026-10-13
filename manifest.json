@@ -4,10 +4,10 @@
     {
       "id": "automation_ga",
       "name": "Generative Agent",
-      "version": "1.6.1",
+      "version": "1.7.0",
       "description": "Generative-Agent automation runner: LLM-authored smart-home automation rules executed by a deterministic runner, with an LLM reflection pass that proposes automations for human approval, chat feedback that mutes the chattiness, and kernel tools.",
       "entry": "cores/automation_ga_core.py",
-      "sha256": "4ccf0b204bbe0a9929cc2a9c0e67c0d33732c6e17e8683872e846fb839f85af3"
+      "sha256": "bdf6cd9360c0adb272a257fe2c982fa4283a150dc2c91ebb423fdc4a8518454e"
     }
   ]
 }

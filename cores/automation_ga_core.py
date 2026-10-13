@@ -133,7 +133,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes
     _tater_agent_lab_path = None
 
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 CORE_DESCRIPTION = (
     "Generative Agent automations: the LLM authors automations as validated JSON definitions "
     "(chat or form editor) and a deterministic polling runner executes them — entity state and "
@@ -2201,6 +2201,72 @@ def _entity_activity_hint(rc: Any, entity_id: str, rows: Optional[Dict[str, Dict
         chain = " → ".join(f"{frm}→{to}" for frm, to, _ts in transitions[-4:])
         parts.append(f"recent: {chain}")
     return "; ".join(parts)
+
+
+def _definition_trigger_mode(trigger: Dict[str, Any]) -> str:
+    """Which 'What should happen?' card a saved entity_state trigger represents.
+
+    A settle trigger is the to_state-only edge form (no from_state) — anchored on the
+    destination state, optionally held for_seconds before firing, which is stable
+    across the device's transition path.
+    """
+    trigger = trigger if isinstance(trigger, dict) else {}
+    if _text(trigger.get("attribute")):
+        return "attribute"
+    if _text(trigger.get("to_state")) and not _text(trigger.get("from_state")):
+        return "settle"
+    if _text(trigger.get("from_state")) or _text(trigger.get("to_state")):
+        return "change"
+    return "hold"
+
+
+def _entity_transition_hint(rc: Any, entity_id: str, rows: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+    """Transition-chain line for the form editor: live state plus every learned transition with its time."""
+    entity_id = _text(entity_id)
+    if not entity_id:
+        return ""
+    if rows is None:
+        rows = _ha_entities(rc)
+    row = rows.get(entity_id)
+    live = _text(row.get("state")) if row else ""
+    transitions = _state_catalog_transitions(rc, entity_id, limit=_STATE_CATALOG_MAX_TRANSITIONS)
+    parts: List[str] = []
+    if live:
+        parts.append(f"state '{live}'")
+    if transitions:
+        chain = " · ".join(
+            f"{frm}→{to} {datetime.fromtimestamp(ts).strftime('%H:%M')}" if ts > 0 else f"{frm}→{to}"
+            for frm, to, ts in transitions
+        )
+        parts.append(f"recent: {chain}")
+    elif not parts:
+        return "No history yet — picks up once the device has been watched as it changes."
+    else:
+        parts.append("no transitions recorded yet")
+    return "; ".join(parts)
+
+
+def _transition_hint_dependency(rc: Any, entity_ids: Iterable[Any], *, rows: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Options for the read-only 'Recent transitions' strip: one per entity, narrowed by trigger_entity
+    so the line follows the Device select without a form reload."""
+    if rows is None:
+        rows = _ha_entities(rc)
+    options_by_source: Dict[str, List[Dict[str, str]]] = {
+        _FORM_CUSTOM_SENTINEL: [{
+            "value": "",
+            "label": "Type the entity id — history shows once the device has been watched.",
+        }],
+    }
+    for entity_id in entity_ids:
+        token = _text(entity_id)
+        if not token or token in options_by_source:
+            continue
+        options_by_source[token] = [{"value": "", "label": _entity_transition_hint(rc, token, rows=rows)}]
+    return {
+        "source_key": "trigger_entity",
+        "options_by_source": options_by_source,
+        "default_options": [{"value": "", "label": "Pick a device to see its recent transitions."}],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -5671,6 +5737,10 @@ REQUIRED:
     {{"type": "entity_state", "entity": "sensor.washer", "from_state": "spinning", "to_state": "finished", "for_seconds": 0}}
         (edge trigger: fires once per state TRANSITION, not while the state holds; omit from_state = from any state;
          omit to_state = any change out of from_state; both omitted = any change. Use for 'when the washer finishes'.)
+    {{"type": "entity_state", "entity": "sensor.washer", "to_state": "end", "for_seconds": 20}}
+        (PREFERRED for 'done/finished'-style states: omit from_state — device cycles pass intermediate
+         states so a specific from_state like 'running' often never matches the finish; for_seconds
+         (e.g. 10-30) suppresses flicker by firing only after the new state holds that long)
     {{"type": "entity_state", "entity": "sensor.living_temp", "attribute": "current_temperature", "match": "above", "value": 27}}
         (attribute: dotted path into HA attributes, e.g. current_temperature; match: equals | not_equals | contains | above | below;
          cannot be combined with from_state/to_state)
@@ -6653,6 +6723,10 @@ def _definition_from_form(
             raise ValueError("Choose the device to watch, or pick 'Custom entity ID…' and type an entity id.")
         trigger = {"type": "entity_state", "entity": entity_id}
         trigger_mode = _token(v("trigger_mode", "hold")) or "hold"
+        settle_mode = trigger_mode == "settle"
+        if settle_mode:
+            # settle is the to_state-only edge form: anchor on the destination, ignore the path
+            trigger_mode = "change"
         if trigger_mode == "attribute":
             attribute = _text(v("trigger_attribute"))
             if not attribute:
@@ -6667,13 +6741,15 @@ def _definition_from_form(
             trigger["match"] = match
             trigger["value"] = value
         elif trigger_mode == "change":
-            from_state = _text(v("trigger_from_state"))
             to_state = _text(v("trigger_to_state"))
-            if from_state == _FORM_CUSTOM_SENTINEL:
-                from_state = ""
             if to_state == _FORM_CUSTOM_SENTINEL:
                 to_state = ""
-            if from_state:
+            if settle_mode and not to_state:
+                raise ValueError("Choose the state it should settle into, e.g. end.")
+            from_state = _text(v("trigger_from_state"))
+            if from_state == _FORM_CUSTOM_SENTINEL:
+                from_state = ""
+            if from_state and not settle_mode:
                 trigger["from_state"] = from_state
             if to_state:
                 trigger["to_state"] = to_state
@@ -7073,12 +7149,9 @@ def _editor_fields(
         ensure=ensure_map,
         rows=entity_rows,
     )
-    trigger_mode = (
-        "attribute"
-        if _text(trigger.get("attribute"))
-        else ("change" if (_text(trigger.get("from_state")) or _text(trigger.get("to_state"))) else "hold")
-    )
+    trigger_mode = _definition_trigger_mode(trigger)
     activity_hint = _entity_activity_hint(client, _text(trigger.get("entity")), rows=entity_rows)
+    dep_transition_hint = _transition_hint_dependency(client, dep_entity_ids, rows=entity_rows)
 
     fields: List[Dict[str, Any]] = [
         {"key": "heading_basics", "label": "1. Basics", "type": "section_heading"},
@@ -7163,6 +7236,18 @@ def _editor_fields(
             **show("trigger_entity", _FORM_CUSTOM_SENTINEL),
         },
         {
+            "key": "trigger_transition_hint",
+            "label": "Recent transitions",
+            "type": "select",
+            "options": [],
+            "read_only": True,
+            "full_width": True,
+            "value": "",
+            "dependent_options": dict(dep_transition_hint, source_key="trigger_entity"),
+            "description": "Learned from Home Assistant history — a From/To trigger must match the last transition exactly.",
+            **show("trigger_type", "entity_state"),
+        },
+        {
             "key": "trigger_mode",
             "label": "What should happen?",
             "type": "select",
@@ -7171,6 +7256,7 @@ def _editor_fields(
             "value": trigger_mode,
             "options": [
                 {"value": "change", "label": "It changes", "description": "Fire once when the state changes (from → to).", "icon": "⇄"},
+                {"value": "settle", "label": "It settles into a state", "description": "Fire once after a state is reached and holds for the set seconds — the safe choice for 'done' states; the path there doesn't matter.", "icon": "⏳"},
                 {"value": "hold", "label": "It has a state", "description": "Fire while the state matches.", "icon": "◼"},
                 {"value": "attribute", "label": "Advanced", "description": "Match an attribute like temperature or brightness.", "icon": "⚙"},
             ],
@@ -7194,7 +7280,7 @@ def _editor_fields(
             "dependent_options": dict(dep_any_base, source_key="trigger_entity"),
             "value": _text(trigger.get("to_state")),
             "description": "Both 'Any state' = fire on every change",
-            **show_any("trigger_mode", ("change",)),
+            **show_any("trigger_mode", ("change", "settle")),
         },
         {
             "key": "trigger_edge_for_seconds",
@@ -7202,9 +7288,9 @@ def _editor_fields(
             "type": "number",
             "min": 0,
             "max": 86400,
-            "value": _int(trigger.get("for_seconds"), 0) if trigger_mode == "change" else 0,
-            "description": "0 = fire immediately on the change",
-            **show_any("trigger_mode", ("change",)),
+            "value": _int(trigger.get("for_seconds"), 0) if trigger_mode in ("change", "settle") else 0,
+            "description": "0 = fire immediately on the change; otherwise fire once after the new state holds this long",
+            **show_any("trigger_mode", ("change", "settle")),
         },
         {
             "key": "trigger_state",
@@ -7942,9 +8028,13 @@ def _trigger_label(trigger: Any) -> str:
         if attribute:
             match = _token(trigger.get("match")) or "equals"
             return f"{entity_id} {attribute} {match.replace('_', ' ')} {_text(trigger.get('value'))}"
-        state = _text(trigger.get("state"))
         for_seconds = _int(trigger.get("for_seconds"), 0)
         suffix = f" (hold {for_seconds:.0f}s)" if for_seconds else ""
+        from_state = _text(trigger.get("from_state"))
+        to_state = _text(trigger.get("to_state"))
+        if from_state or to_state:
+            return f"{entity_id}: {from_state or 'any'} → {to_state or 'leaves'}{suffix}"
+        state = _text(trigger.get("state"))
         return f"{entity_id} = {state}{suffix}" if state else entity_id or "—"
     if trigger_type == "time":
         return f"Daily at {_text(trigger.get('time')) or '—'}"

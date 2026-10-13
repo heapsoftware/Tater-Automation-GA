@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.7.0 — 2026-10-13 (minor — form editor: recent-transitions strip + settle trigger card)
+
+- **Features**
+  - **Recent-transitions strip in the form editor:** a new read-only
+    "Recent transitions" line sits right beside the From/To state pickers and
+    shows what the device has actually done — its live state plus every
+    transition learned from Home Assistant history, with timestamps
+    (e.g. `state 'end'; recent: off→spinning 05:27 · spinning→rinsing 05:39 ·
+    rinsing→spinning 05:50 · spinning→end 06:05`). The strip re-narrows live
+    when the Device select changes (rendered via the existing
+    `dependent_options` mechanism), so a wrong From state guess like
+    `running` for a washer finish is visible before saving.
+  - **New "What should happen?" card — "It settles into a state":** a
+    destination-only edge trigger (To state + hold seconds, no From state).
+    Fires once after the state is reached and holds for the set seconds,
+    regardless of the path that got there — the robust pattern for
+    'done/finished'-style states that can flicker. Settle requires a
+    destination state, deliberately drops any From state, and re-opens as the
+    settle card on edit. The saved schema is the existing
+    `{to_state, for_seconds}` edge form, so nothing about the runner or
+    definition schema changes.
+  - **Clearer trigger labels:** automation cards now show edge triggers as
+    `entity: any → end (hold 15s)`-style summaries instead of the generic
+    "Entity State".
+  - **LLM authoring guidance:** the kernel-tools schema prompt now documents
+    the preferred `'done'`-state pattern (`to_state` + small `for_seconds`,
+    no `from_state`) so chat-authored automations avoid the same trap.
+- **Tests** (offline mirror — tests are local-only, never shipped)
+  - Smoke suite: settle save mapping, stale From-state dropping, missing
+    destination rejected, settle/hold round-trips, and the transitions strip
+    (narrowing, learned chain, default text). 332 checks green; checklist
+    114/114.
+
 ## 1.6.1 — 2026-10-11 (revision — announce reliability: subject kept, LLM-down fallback)
 
 - **Features**
